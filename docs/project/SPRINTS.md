@@ -66,14 +66,14 @@
 - DL-001: Incomplete output safety.
 - DL-002: Block request timeouts/retries. ✅
 - DL-003: Enforced piece hash retries. ✅
-- DL-005: In-flight request tracking.
+- DL-005: In-flight request tracking. ✅
 
 **Engineering Tasks**
 
 - Add block-level request tracking. ✅
 - Add peer timeout/penalty behavior. ✅
 - Add clear job error states.
-- Add tests for piece state and request scheduling where practical.
+- Add tests for piece state and request scheduling where practical. ✅
 
 **Demo**
 
@@ -84,6 +84,7 @@
 
 - DL-002 completed: block requests are tracked, timed-out blocks are released for retry, and peers with repeated timeouts are banned/disconnected for the session.
 - DL-003 completed: corrupt pieces are discarded, requeued, counted, and repeated bad-piece peers are banned/disconnected for the session.
+- DL-005 completed: piece assignment now preserves unavailable queue entries, avoids duplicate assignment when alternatives exist, and requeues disconnected peer work once.
 
 ## Sprint 3 — Persistence and Resume Basics
 

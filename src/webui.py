@@ -791,6 +791,7 @@ function renderJobs(jobs) {
         <div class="metric"><div class="label">Queued</div><div class="value">${stats.queued_peers || 0}</div></div>
         <div class="metric"><div class="label">Elapsed</div><div class="value">${fmtDuration(stats.elapsed || 0)}</div></div>
         <div class="metric"><div class="label">Bad pieces</div><div class="value">${stats.bad_pieces || 0}</div></div>
+        <div class="metric"><div class="label">Assigned pieces</div><div class="value">${stats.assigned_pieces || 0}</div></div>
         <div class="metric"><div class="label">Output</div><div class="value">${escapeHtml(stats.output_available ? `Available · ${fmtBytes(stats.output_size)}` : 'Not available yet')}</div></div>
         <div class="metric"><div class="label">Path</div><div class="value">${escapeHtml(stats.output_path || job.output_dir)}</div></div>
       </div>

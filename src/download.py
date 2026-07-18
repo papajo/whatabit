@@ -414,6 +414,64 @@ class DownloadManager:
             )
         return len(expired)
 
+    def _assigned_piece_indices(self, *, except_peer_key: str = "") -> set[int]:
+        return {
+            piece_index
+            for peer_key, piece_index in self.peer_current_piece.items()
+            if peer_key != except_peer_key
+        }
+
+    def _remove_piece_from_queue(self, index: int) -> None:
+        self.piece_queue = [candidate for candidate in self.piece_queue if candidate != index]
+
+    def _queue_piece(self, index: int) -> None:
+        if index < 0 or index >= len(self.pieces):
+            return
+        if self.pieces[index].is_complete:
+            return
+        if index in self.piece_queue:
+            return
+        if index in self._assigned_piece_indices():
+            return
+        self.piece_queue.append(index)
+
+    def _peer_has_piece(self, peer: PeerConnection, index: int) -> bool:
+        return bool(peer.bitfield and index < len(peer.bitfield) and peer.bitfield[index])
+
+    def _pop_next_piece_for_peer(self, peer: PeerConnection, peer_key: str) -> int | None:
+        assigned_elsewhere = self._assigned_piece_indices(except_peer_key=peer_key)
+        kept: list[int] = []
+        selected: int | None = None
+
+        while self.piece_queue:
+            candidate = self.piece_queue.pop(0)
+            if candidate in kept:
+                continue
+            if candidate >= len(self.pieces) or self.pieces[candidate].is_complete:
+                continue
+            if candidate in assigned_elsewhere:
+                kept.append(candidate)
+                continue
+            if not self._peer_has_piece(peer, candidate):
+                kept.append(candidate)
+                continue
+            if self._next_missing_block(self.pieces[candidate]) is None:
+                kept.append(candidate)
+                continue
+            selected = candidate
+            break
+
+        self.piece_queue = kept + [
+            candidate for candidate in self.piece_queue if candidate not in kept
+        ]
+        return selected
+
+    def _release_peer_piece(self, peer_key: str, *, requeue: bool = True) -> int | None:
+        current_idx = self.peer_current_piece.pop(peer_key, None)
+        if current_idx is not None and requeue:
+            self._queue_piece(current_idx)
+        return current_idx
+
     async def _handle_piece_hash_failure(self, peer: PeerConnection, index: int, piece: PieceState) -> None:
         """Discard a corrupt piece, requeue it, and penalize the sender."""
 
@@ -438,10 +496,8 @@ class DownloadManager:
             if key[0] == index:
                 self.block_retry_count.pop(key, None)
 
-        if index not in self.piece_queue:
-            self.piece_queue.append(index)
-
-        self.peer_current_piece.pop(peer_key, None)
+        self._release_peer_piece(peer_key, requeue=False)
+        self._queue_piece(index)
         self.peer_pending_count[peer_key] = 0
         self._set_status(
             "downloading",
@@ -492,9 +548,13 @@ class DownloadManager:
             await self._request_next_block(peer)
 
     async def _write_piece(self, index: int, data: bytes):
-        """Write a completed piece to the output file."""
+        """Record a completed piece and clear scheduling state for it."""
         self.downloaded_pieces[index] = data
         self.pending_pieces.pop(index, None)
+        self._remove_piece_from_queue(index)
+        for peer_key, piece_index in list(self.peer_current_piece.items()):
+            if piece_index == index:
+                self.peer_current_piece.pop(peer_key, None)
 
     def _update_progress(self):
         """Calculate and report progress."""
@@ -559,12 +619,13 @@ class DownloadManager:
             return
 
         # Find a piece this peer has that we need
-        peer_key = f"{peer.ip}:{peer.port}"
+        peer_key = self._peer_key(peer)
         current_piece_idx = self.peer_current_piece.get(peer_key)
 
         if current_piece_idx is not None:
             piece = self.pieces[current_piece_idx]
             if piece.is_complete:
+                self._release_peer_piece(peer_key, requeue=False)
                 current_piece_idx = None
             elif self.peer_pending_count.get(peer_key, 0) < MAX_PIPELINED_REQUESTS:
                 next_block = self._next_missing_block(piece)
@@ -573,33 +634,20 @@ class DownloadManager:
                     await self._send_block_request(peer, current_piece_idx, block_begin, block_size)
                     return
 
-        # Find a new piece to download
-        if current_piece_idx is None or self.pieces[current_piece_idx].is_complete:
-            # Get next piece from queue
-            while self.piece_queue:
-                candidate = self.piece_queue.pop(0)
-                if (not self.pieces[candidate].is_complete and
-                    peer.bitfield and candidate < len(peer.bitfield) and
-                    peer.bitfield[candidate]):
-                    self.peer_current_piece[peer_key] = candidate
-                    piece = self.pieces[candidate]
-                    next_block = self._next_missing_block(piece)
-                    if next_block is None:
-                        continue
-                    block_begin, block_size = next_block
-                    await self._send_block_request(peer, candidate, block_begin, block_size)
-                    return
-                elif (not self.pieces[candidate].is_complete and
-                      not peer.bitfield):
-                    # No bitfield yet, can't check - try anyway
-                    self.peer_current_piece[peer_key] = candidate
-                    piece = self.pieces[candidate]
-                    next_block = self._next_missing_block(piece)
-                    if next_block is None:
-                        continue
-                    block_begin, block_size = next_block
-                    await self._send_block_request(peer, candidate, block_begin, block_size)
-                    return
+        if current_piece_idx is not None:
+            return
+
+        candidate = self._pop_next_piece_for_peer(peer, peer_key)
+        if candidate is None:
+            return
+
+        self.peer_current_piece[peer_key] = candidate
+        next_block = self._next_missing_block(self.pieces[candidate])
+        if next_block is None:
+            self._release_peer_piece(peer_key, requeue=True)
+            return
+        block_begin, block_size = next_block
+        await self._send_block_request(peer, candidate, block_begin, block_size)
 
     async def _handle_peer_connect(self, peer: PeerConnection) -> bool:
         """Try to connect to a peer, send interested on success."""
@@ -617,11 +665,9 @@ class DownloadManager:
         if peer in self.active_connections:
             self.active_connections.remove(peer)
 
-        peer_key = f"{peer.ip}:{peer.port}"
+        peer_key = self._peer_key(peer)
         # Re-queue any piece this peer was working on
-        current_idx = self.peer_current_piece.pop(peer_key, None)
-        if current_idx is not None and not self.pieces[current_idx].is_complete:
-            self.piece_queue.append(current_idx)
+        self._release_peer_piece(peer_key, requeue=True)
         for (piece_index, begin), request in list(self.pending_requests.items()):
             if request.get("peer_key") == peer_key:
                 self._clear_pending_request(piece_index, begin)
@@ -755,6 +801,8 @@ class DownloadManager:
             "peers_discovered": self.peers_discovered,
             "queued_peers": len(self.peer_pool),
             "banned_peers": len(self.banned_peers),
+            "queued_pieces": len(self.piece_queue),
+            "assigned_pieces": len(self._assigned_piece_indices()),
             "pending_requests": len(self.pending_requests),
             "timed_out_requests": self.timed_out_requests,
             "bad_pieces": self.bad_pieces,
