@@ -1,0 +1,15 @@
+.harness/workspace/
+.harness/offloads/
+.harness/threads/
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.env
+
+# Agent Zero project/runtime metadata
+.a0proj/
+
+# Local downloads and test artifacts
+downloads/
+*.torrent

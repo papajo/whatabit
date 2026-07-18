@@ -1,0 +1,529 @@
+"""Download manager - main orchestrator for BitTorrent downloads.
+
+Manages the full download lifecycle:
+1. Parse .torrent file
+2. Contact tracker (UDP or HTTP) for peer list
+3. Connect to peers and perform handshake
+4. Manage piece/block request queue
+5. Verify SHA-1 piece hashes
+6. Write completed data to output file
+"""
+
+import asyncio
+import hashlib
+import logging
+import os
+import random
+import time
+from typing import Optional, Callable
+
+from .bencode import encode
+from .torrent import TorrentFile
+from .tracker import (
+    udp_connect, udp_announce, generate_peer_id,
+    EVENT_NONE, EVENT_STARTED, EVENT_STOPPED, EVENT_COMPLETED,
+    TrackerError,
+)
+from .http_tracker import http_announce, build_announce_url
+from .peer import (
+    PeerConnection, parse_piece, parse_have, parse_bitfield,
+    DEFAULT_BLOCK_SIZE, MSG_CHOKE, MSG_UNCHOKE, MSG_INTERESTED,
+    MSG_NOT_INTERESTED, MSG_HAVE, MSG_BITFIELD, MSG_PIECE, MSG_REQUEST,
+)
+
+logger = logging.getLogger("whatabit.download")
+
+
+class PieceState:
+    """Tracks download state of a single piece."""
+    __slots__ = ("index", "length", "blocks", "received", "hash", "is_complete", "failed_peers")
+
+    def __init__(self, index: int, length: int, piece_hash: bytes):
+        self.index = index
+        self.length = length
+        self.hash = piece_hash
+        self.blocks: dict[int, bytes] = {}  # begin offset -> block data
+        self.received = 0
+        self.is_complete = False
+        self.failed_peers: set[str] = set()
+
+    @property
+    def is_full(self) -> bool:
+        return self.received >= self.length
+
+    def add_block(self, begin: int, data: bytes):
+        if begin not in self.blocks:
+            self.blocks[begin] = data
+            self.received += len(data)
+            if self.received >= self.length:
+                self.is_complete = True
+
+    def get_data(self) -> bytes:
+        """Assemble block data in order."""
+        result = bytearray(self.length)
+        for begin, data in self.blocks.items():
+            result[begin:begin+len(data)] = data
+        return bytes(result)
+
+    def verify(self) -> bool:
+        """Verify SHA-1 hash against the piece data."""
+        data = self.get_data()
+        return hashlib.sha1(data).digest() == self.hash
+
+    def __repr__(self):
+        return f"Piece({self.index}, {self.received}/{self.length}, complete={self.is_complete})"
+
+
+class DownloadManager:
+    """Orchestrates the complete BitTorrent download process."""
+
+    def __init__(
+        self,
+        torrent_path: str,
+        output_dir: str = ".",
+        max_peers: int = 50,
+        max_connections: int = 20,
+        port: int = 6881,
+        progress_callback: Optional[Callable] = None,
+    ):
+        self.torrent_path = torrent_path
+        self.output_dir = output_dir
+        self.max_peers = max_peers
+        self.max_connections = max_connections
+        self.port = port
+        self.progress_callback = progress_callback
+
+        # Parse torrent
+        self.torrent = TorrentFile(torrent_path)
+        self.info_hash = self.torrent.info_hash
+        self.pieces: list[PieceState] = []
+        self.peer_id = generate_peer_id()
+
+        # Peer management
+        self.peer_pool: list[tuple[str, int]] = []
+        self.active_connections: list[PeerConnection] = []
+        self.banned_peers: set[str] = set()
+
+        # Piece management
+        self.piece_queue: list[int] = []
+        self.pending_pieces: dict[int, PieceState] = {}
+        self.downloaded_pieces: list[Optional[bytes]] = []
+        self.bytes_downloaded = 0
+
+        # Piece assignment tracking
+        self.peer_current_piece: dict[str, int] = {}  # ip:port -> current piece index
+        self.peer_pending_count: dict[str, int] = {}  # ip:port -> pending request count
+
+        # Output file
+        self.output_path = ""
+        self.output_file: Optional[asyncio.FileIO] = None
+
+        # Control
+        self.running = False
+        self.completed = False
+        self.start_time = 0.0
+
+        # Compute piece sizes
+        self._init_pieces()
+
+    def _init_pieces(self):
+        """Initialize piece state from torrent metadata."""
+        piece_length = self.torrent.piece_length
+        total_length = self.torrent.total_length
+        num_pieces = len(self.torrent.pieces)
+
+        for i in range(num_pieces):
+            if i == num_pieces - 1:
+                # Last piece may be shorter
+                p_len = total_length - (i * piece_length)
+            else:
+                p_len = piece_length
+            self.pieces.append(PieceState(i, p_len, self.torrent.pieces[i]))
+            self.piece_queue.append(i)
+
+        self.downloaded_pieces = [None] * num_pieces
+
+        random.shuffle(self.piece_queue)
+
+    async def _contact_udp_tracker(self) -> list[tuple[str, int]]:
+        """Contact UDP tracker and return list of peers."""
+        if not self.torrent.announce.startswith("udp://"):
+            return []
+
+        try:
+            conn_id, _ = udp_connect(self.torrent.announce)
+            interval, leechers, seeders, peers = udp_announce(
+                conn_id,
+                self.torrent.announce,
+                self.info_hash,
+                self.peer_id,
+                left=self.torrent.total_length,
+                event=EVENT_STARTED,
+            )
+            logger.info(f"UDP tracker: {len(peers)} peers, seeders={seeders}, leechers={leechers}")
+            return peers
+        except TrackerError as e:
+            logger.warning(f"UDP tracker failed: {e}")
+            return []
+
+    async def _contact_http_tracker(self) -> list[tuple[str, int]]:
+        """Contact HTTP tracker and return list of peers."""
+        url = self.torrent.announce
+        if not (url.startswith("http://") or url.startswith("https://")):
+            return []
+
+        try:
+            interval, leechers, seeders, peers = await http_announce(
+                url,
+                self.info_hash,
+                self.peer_id,
+                port=self.port,
+                left=self.torrent.total_length,
+            )
+            logger.info(f"HTTP tracker: {len(peers)} peers, seeders={seeders}, leechers={leechers}")
+            return peers
+        except Exception as e:
+            logger.warning(f"HTTP tracker failed: {e}")
+            return []
+
+    async def get_peers(self) -> list[tuple[str, int]]:
+        """Get peers from tracker(s). Supports both UDP and HTTP."""
+        all_peers = []
+
+        # Try primary announce URL
+        if self.torrent.announce.startswith("udp://"):
+            peers = await self._contact_udp_tracker()
+            all_peers.extend(peers)
+        elif self.torrent.announce.startswith(("http://", "https://")):
+            peers = await self._contact_http_tracker()
+            all_peers.extend(peers)
+
+        # Try announce-list if available
+        if self.torrent.announce_list:
+            for tier in self.torrent.announce_list:
+                for url in tier:
+                    url_str = url.decode("utf-8", errors="replace") if isinstance(url, bytes) else url
+                    if url_str == self.torrent.announce:
+                        continue  # Already tried
+                    try:
+                        if url_str.startswith("udp://"):
+                            conn_id, _ = udp_connect(url_str)
+                            interval, l, s, peers = udp_announce(
+                                conn_id, url_str, self.info_hash, self.peer_id,
+                                left=self.torrent.total_length,
+                            )
+                            all_peers.extend(peers)
+                        elif url_str.startswith(("http://", "https://")):
+                            interval, l, s, peers = await http_announce(
+                                url_str, self.info_hash, self.peer_id, port=self.port,
+                                left=self.torrent.total_length,
+                            )
+                            all_peers.extend(peers)
+                    except Exception as e:
+                        logger.debug(f"Tier tracker {url_str} failed: {e}")
+                        continue
+
+        # Deduplicate
+        seen = set()
+        unique_peers = []
+        for ip, port in all_peers:
+            key = f"{ip}:{port}"
+            if key not in seen and key not in self.banned_peers:
+                seen.add(key)
+                unique_peers.append((ip, port))
+
+        random.shuffle(unique_peers)
+        return unique_peers[:self.max_peers]
+
+    async def _handle_message(self, peer: PeerConnection, msg: dict):
+        """Handle an incoming message from a peer."""
+        msg_id = msg["msg_id"]
+        payload = msg["payload"]
+
+        if msg_id == MSG_CHOKE:
+            peer.peer_choking = True
+            logger.debug(f"{peer} choked us")
+
+        elif msg_id == MSG_UNCHOKE:
+            peer.peer_choking = False
+            logger.debug(f"{peer} unchoked us")
+            # Request next block from this peer
+            await self._request_next_block(peer)
+
+        elif msg_id == MSG_INTERESTED:
+            peer.peer_interested = True
+
+        elif msg_id == MSG_NOT_INTERESTED:
+            peer.peer_interested = False
+
+        elif msg_id == MSG_HAVE:
+            piece_index = parse_have(payload)
+            if peer.bitfield and piece_index < len(peer.bitfield):
+                peer.bitfield[piece_index] = True
+
+        elif msg_id == MSG_BITFIELD:
+            peer.bitfield = parse_bitfield(payload, len(self.pieces))
+            # Send interested if peer has pieces we need
+            if not peer.am_interested and any(
+                peer.bitfield[i] and not self.pieces[i].is_complete
+                for i in range(len(self.pieces))
+            ):
+                await peer.send_interested()
+
+        elif msg_id == MSG_PIECE:
+            index, begin, block = parse_piece(payload)
+            await self._handle_piece_data(peer, index, begin, block)
+
+    async def _handle_piece_data(self, peer: PeerConnection, index: int, begin: int, block: bytes):
+        """Handle received piece data."""
+        if index >= len(self.pieces):
+            return
+
+        piece = self.pieces[index]
+        if piece.is_complete:
+            return
+
+        piece.add_block(begin, block)
+        self.bytes_downloaded += len(block)
+
+        # Decrement pending count
+        peer_key = f"{peer.ip}:{peer.port}"
+        self.peer_pending_count[peer_key] = self.peer_pending_count.get(peer_key, 0) - 1
+
+        if piece.is_complete:
+            # Verify piece hash
+            if piece.verify():
+                logger.info(f"Piece {index}/{len(self.pieces)} verified OK")
+                await self._write_piece(index, piece.get_data())
+                
+                # Notify other peers we have this piece
+                for conn in self.active_connections:
+                    if conn.is_connected:
+                        await conn.send_have(index)
+                
+                self._update_progress()
+                await self._request_next_block(peer)
+            else:
+                logger.warning(f"Piece {index} hash mismatch! Re-requesting...")
+                # Reset piece and re-request
+                self.pieces[index] = PieceState(index, piece.length, piece.hash)
+                self.piece_queue.append(index)
+        else:
+            # Request next block for this piece or a new piece
+            await self._request_next_block(peer)
+
+    async def _write_piece(self, index: int, data: bytes):
+        """Write a completed piece to the output file."""
+        self.downloaded_pieces[index] = data
+        self.pending_pieces.pop(index, None)
+
+    def _update_progress(self):
+        """Calculate and report progress."""
+        completed = sum(1 for p in self.downloaded_pieces if p is not None)
+        total = len(self.downloaded_pieces)
+        elapsed = time.time() - self.start_time
+        speed = self.bytes_downloaded / elapsed if elapsed > 0 else 0
+
+        logger.info(f"Progress: {completed}/{total} pieces complete, {self.bytes_downloaded / (1024*1024):.1f} MiB, {speed / 1024:.1f} KiB/s")
+
+        if self.progress_callback:
+            self.progress_callback(completed, total, self.bytes_downloaded, speed)
+
+        if completed >= total:
+            self.completed = True
+
+    async def _flush_output(self):
+        """Assemble and write all pieces to the output file."""
+        os.makedirs(self.output_dir, exist_ok=True)
+        output_path = os.path.join(self.output_dir, self.torrent.name)
+
+        logger.info(f"Writing output to {output_path}")
+        with open(output_path, "wb") as f:
+            for i, data in enumerate(self.downloaded_pieces):
+                if data is not None:
+                    f.write(data)
+                else:
+                    # Missing piece - fill with zeros
+                    f.write(b"\x00" * self.pieces[i].length)
+                    logger.warning(f"Piece {i} missing, filling with zeros")
+
+        logger.info(f"Output written to {output_path}")
+
+    async def _request_next_block(self, peer: PeerConnection):
+        """Request the next block from a peer."""
+        if peer.peer_choking:
+            return
+
+        if not peer.bitfield:
+            return
+
+        # Find a piece this peer has that we need
+        peer_key = f"{peer.ip}:{peer.port}"
+        current_piece_idx = self.peer_current_piece.get(peer_key)
+
+        if current_piece_idx is not None:
+            piece = self.pieces[current_piece_idx]
+            if piece.is_complete:
+                current_piece_idx = None
+            elif self.peer_pending_count.get(peer_key, 0) < 5:
+                # Request next block for current piece
+                block_begin = piece.received
+                if block_begin < piece.length:
+                    block_size = min(DEFAULT_BLOCK_SIZE, piece.length - block_begin)
+                    await peer.send_request(current_piece_idx, block_begin, block_size)
+                    self.peer_pending_count[peer_key] = self.peer_pending_count.get(peer_key, 0) + 1
+                    return
+
+        # Find a new piece to download
+        if current_piece_idx is None or self.pieces[current_piece_idx].is_complete:
+            # Get next piece from queue
+            while self.piece_queue:
+                candidate = self.piece_queue.pop(0)
+                if (not self.pieces[candidate].is_complete and
+                    peer.bitfield and candidate < len(peer.bitfield) and
+                    peer.bitfield[candidate]):
+                    self.peer_current_piece[peer_key] = candidate
+                    piece = self.pieces[candidate]
+                    block_size = min(DEFAULT_BLOCK_SIZE, piece.length)
+                    await peer.send_request(candidate, 0, block_size)
+                    self.peer_pending_count[peer_key] = self.peer_pending_count.get(peer_key, 0) + 1
+                    return
+                elif (not self.pieces[candidate].is_complete and
+                      not peer.bitfield):
+                    # No bitfield yet, can't check - try anyway
+                    self.peer_current_piece[peer_key] = candidate
+                    piece = self.pieces[candidate]
+                    block_size = min(DEFAULT_BLOCK_SIZE, piece.length)
+                    await peer.send_request(candidate, 0, block_size)
+                    self.peer_pending_count[peer_key] = self.peer_pending_count.get(peer_key, 0) + 1
+                    return
+
+    async def _handle_peer_connect(self, peer: PeerConnection) -> bool:
+        """Try to connect to a peer, send interested on success."""
+        success = await peer.connect()
+        if success:
+            self.active_connections.append(peer)
+            peer.on_message = self._handle_message
+            # Start reading messages in background
+            asyncio.create_task(peer.read_loop())
+            return True
+        return False
+
+    async def _handle_peer_disconnect(self, peer: PeerConnection):
+        """Handle peer disconnection."""
+        if peer in self.active_connections:
+            self.active_connections.remove(peer)
+
+        peer_key = f"{peer.ip}:{peer.port}"
+        # Re-queue any piece this peer was working on
+        current_idx = self.peer_current_piece.pop(peer_key, None)
+        if current_idx is not None and not self.pieces[current_idx].is_complete:
+            self.piece_queue.append(current_idx)
+        self.peer_pending_count.pop(peer_key, None)
+
+    async def connect_to_peers(self):
+        """Connect to peers from the pool."""
+        while self.running and not self.completed and self.peer_pool:
+            # Fill up to max_connections
+            while len(self.active_connections) < self.max_connections and self.peer_pool:
+                ip, port = self.peer_pool.pop(0)
+                peer = PeerConnection(
+                    ip, port,
+                    self.info_hash,
+                    self.peer_id,
+                    on_message=self._handle_message,
+                    on_disconnect=self._handle_peer_disconnect,
+                )
+                success = await peer.connect()
+                if success:
+                    self.active_connections.append(peer)
+                    peer.on_message = self._handle_message
+                    peer.on_disconnect = self._handle_peer_disconnect
+                    asyncio.create_task(peer.read_loop())
+                else:
+                    self.banned_peers.add(f"{ip}:{port}")
+
+            if not self.active_connections:
+                await asyncio.sleep(5)
+                continue
+
+            await asyncio.sleep(0.5)
+
+            # Clean disconnected peers
+            self.active_connections = [
+                c for c in self.active_connections if c.is_connected
+            ]
+
+    async def download(self):
+        """Main download loop."""
+        logger.info(f"Starting download of {self.torrent.name}")
+        logger.info(f"Info hash: {self.torrent.info_hash_hex}")
+        logger.info(f"Size: {self.torrent.total_length / (1024*1024):.1f} MiB in {len(self.pieces)} pieces")
+
+        self.running = True
+        self.start_time = time.time()
+
+        # Step 1: Get peers from tracker
+        logger.info("Contacting tracker...")
+        self.peer_pool = await self.get_peers()
+        logger.info(f"Got {len(self.peer_pool)} unique peers")
+
+        if not self.peer_pool:
+            logger.warning("No peers found from tracker!")
+            self.running = False
+            return
+
+        # Step 2: Connect to peers and download
+        await self.connect_to_peers()
+
+        # Step 3: Wait for completion or user stop
+        while self.running and not self.completed:
+            await asyncio.sleep(2)
+
+            # Check if all pieces are done
+            all_done = all(p.is_complete for p in self.pieces)
+            if all_done:
+                self.completed = True
+                break
+
+            # If no active connections, try to find more peers
+            if not self.active_connections or all(
+                not c.is_connected for c in self.active_connections
+            ):
+                logger.info("No active peers, re-contacting tracker...")
+                self.peer_pool = await self.get_peers()
+                if self.peer_pool:
+                    await self.connect_to_peers()
+
+            self._update_progress()
+
+        # Step 4: Write output
+        await self._flush_output()
+
+        elapsed = time.time() - self.start_time
+        speed = self.bytes_downloaded / elapsed if elapsed > 0 else 0
+        logger.info(f"Download {'completed' if self.completed else 'stopped'}")
+        logger.info(f"Elapsed: {elapsed:.1f}s, Avg speed: {speed/1024:.1f} KiB/s")
+
+    def stop(self):
+        """Stop the download."""
+        self.running = False
+
+    def get_stats(self) -> dict:
+        """Get current download statistics."""
+        completed = sum(1 for p in self.downloaded_pieces if p is not None)
+        total = len(self.pieces)
+        elapsed = time.time() - self.start_time if self.start_time > 0 else 0
+        speed = self.bytes_downloaded / elapsed if elapsed > 0 else 0
+        return {
+            "name": self.torrent.name,
+            "info_hash": self.torrent.info_hash_hex,
+            "total_size": self.torrent.total_length,
+            "downloaded": self.bytes_downloaded,
+            "pieces_complete": completed,
+            "pieces_total": total,
+            "connected_peers": len([c for c in self.active_connections if c.is_connected]),
+            "speed": speed,
+            "elapsed": elapsed,
+            "is_complete": self.completed,
+        }
