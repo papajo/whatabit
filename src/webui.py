@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import json
 import os
 import time
 import uuid
@@ -57,6 +56,7 @@ class DownloadJob:
     def snapshot(self) -> dict[str, Any]:
         stats = self.manager.get_stats()
         merged = {**stats, **self.progress}
+        output_path = Path(self.output_dir).expanduser() / self.torrent_name
         return {
             "id": self.id,
             "torrent_id": self.torrent_id,
@@ -66,6 +66,7 @@ class DownloadJob:
             "error": self.error,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
+            "download_url": f"/api/downloads/{self.id}/file" if output_path.exists() else "",
             "stats": merged,
         }
 
@@ -84,18 +85,42 @@ class WhataBitWebApp:
     def create_app(self) -> web.Application:
         self.upload_dir.mkdir(parents=True, exist_ok=True)
         self.default_download_dir.mkdir(parents=True, exist_ok=True)
+        self._load_existing_torrents()
 
         app = web.Application(client_max_size=64 * 1024 * 1024)
         app["whatabit"] = self
         app.router.add_get("/", self.index)
         app.router.add_get("/api/torrents", self.list_torrents)
         app.router.add_post("/api/torrents", self.upload_torrent)
+        app.router.add_delete("/api/torrents/{torrent_id}", self.delete_torrent)
         app.router.add_post("/api/downloads", self.start_download)
         app.router.add_get("/api/downloads", self.list_downloads)
         app.router.add_get("/api/downloads/{job_id}", self.get_download)
+        app.router.add_get("/api/downloads/{job_id}/file", self.download_output_file)
         app.router.add_post("/api/downloads/{job_id}/stop", self.stop_download)
         app.on_shutdown.append(self.shutdown)
         return app
+
+    def _load_existing_torrents(self) -> None:
+        """Load previously uploaded torrent files from the local UI workspace."""
+
+        self.torrents.clear()
+        for path in sorted(self.upload_dir.glob("*.torrent")):
+            torrent_id = path.name.split("-", 1)[0]
+            if not torrent_id:
+                continue
+            try:
+                metadata = torrent_metadata(path)
+            except Exception:
+                continue
+            filename = path.name.split("-", 1)[1] if "-" in path.name else path.name
+            self.torrents[torrent_id] = TorrentRecord(
+                id=torrent_id,
+                filename=filename,
+                path=path,
+                added_at=path.stat().st_mtime,
+                metadata=metadata,
+            )
 
     async def shutdown(self, _app: web.Application) -> None:
         for job in self.jobs.values():
@@ -145,6 +170,20 @@ class WhataBitWebApp:
         self.torrents[torrent_id] = record
         return web.json_response({"torrent": record_to_json(record)}, status=201)
 
+    async def delete_torrent(self, request: web.Request) -> web.Response:
+        torrent_id = request.match_info["torrent_id"]
+        record = self.torrents.get(torrent_id)
+        if record is None:
+            raise web.HTTPNotFound(text="Torrent not found")
+
+        active_statuses = {"queued", "running", "stopping"}
+        if any(job.torrent_id == torrent_id and job.status in active_statuses for job in self.jobs.values()):
+            raise web.HTTPConflict(text="Cannot delete a torrent while it has an active download")
+
+        self.torrents.pop(torrent_id, None)
+        record.path.unlink(missing_ok=True)
+        return web.json_response({"ok": True})
+
     async def start_download(self, request: web.Request) -> web.Response:
         data = await request.json()
         torrent_id = str(data.get("torrent_id") or "")
@@ -152,7 +191,7 @@ class WhataBitWebApp:
         if record is None:
             raise web.HTTPNotFound(text="Torrent not found")
 
-        output_dir = str(data.get("output_dir") or self.default_download_dir)
+        output_dir = self._resolve_output_dir(str(data.get("output_dir") or DEFAULT_DOWNLOAD_DIR))
         max_peers = clamp_int(data.get("max_peers"), default=50, minimum=1, maximum=500)
         max_connections = clamp_int(data.get("max_connections"), default=20, minimum=1, maximum=100)
         port = clamp_int(data.get("port"), default=6881, minimum=1, maximum=65535)
@@ -198,6 +237,12 @@ class WhataBitWebApp:
         job.task = asyncio.create_task(self._run_job(job))
         return web.json_response({"job": job.snapshot()}, status=201)
 
+    def _resolve_output_dir(self, value: str) -> str:
+        path = Path(value).expanduser()
+        if not path.is_absolute():
+            path = self.base_dir / path
+        return str(path.resolve(strict=False))
+
     async def _run_job(self, job: DownloadJob) -> None:
         job.status = "running"
         job.updated_at = time.time()
@@ -222,6 +267,16 @@ class WhataBitWebApp:
         if job is None:
             raise web.HTTPNotFound(text="Download job not found")
         return web.json_response({"job": job.snapshot()})
+
+    async def download_output_file(self, request: web.Request) -> web.StreamResponse:
+        job = self.jobs.get(request.match_info["job_id"])
+        if job is None:
+            raise web.HTTPNotFound(text="Download job not found")
+
+        output_path = Path(job.output_dir) / job.torrent_name
+        if not output_path.exists() or not output_path.is_file():
+            raise web.HTTPNotFound(text="Downloaded file is not available yet")
+        return web.FileResponse(output_path)
 
     async def stop_download(self, request: web.Request) -> web.Response:
         job = self.jobs.get(request.match_info["job_id"])
@@ -359,6 +414,10 @@ INDEX_HTML = r"""<!doctype html>
     .file-list { max-height: 150px; overflow: auto; margin-top: 12px; border: 1px solid var(--border); border-radius: 14px; }
     .file-row { padding: 9px 12px; display: flex; justify-content: space-between; gap: 10px; border-top: 1px solid rgba(148,163,184,0.12); color: var(--muted); font-size: 0.86rem; }
     .file-row:first-child { border-top: 0; }
+    .torrent-list { display: grid; gap: 10px; margin-top: 16px; }
+    .torrent-item { padding: 12px; border: 1px solid var(--border); border-radius: 16px; background: rgba(2,6,23,0.34); }
+    .torrent-item.active { border-color: rgba(6,182,212,0.55); background: rgba(6,182,212,0.08); }
+    .tiny { font-size: 0.78rem; }
     @media (max-width: 860px) { .grid, .meta, .settings { grid-template-columns: 1fr; } header { align-items: flex-start; flex-direction: column; } }
   </style>
 </head>
@@ -387,6 +446,12 @@ INDEX_HTML = r"""<!doctype html>
             <label class="file-label" for="torrentInput">Choose torrent</label>
             <input id="torrentInput" type="file" accept=".torrent,application/x-bittorrent" />
           </div>
+          <div class="row" style="justify-content:space-between; margin-top:18px;">
+            <h2 style="margin:0;">Uploaded torrents</h2>
+            <button id="refreshTorrentsBtn" class="secondary" type="button">Refresh</button>
+          </div>
+          <p class="muted tiny" style="margin-top:6px;">Uploaded `.torrent` files are saved locally in <code>.whatabit/torrents/</code> so they are available after restarting the UI.</p>
+          <div id="torrentList" class="torrent-list"><div class="empty" style="padding:20px;">No uploaded torrents yet.</div></div>
           <div id="torrentDetails" class="meta" style="display:none;"></div>
           <div id="fileList" class="file-list" style="display:none;"></div>
         </div>
@@ -429,7 +494,7 @@ INDEX_HTML = r"""<!doctype html>
   <div id="toast" class="toast"></div>
 
 <script>
-const state = { torrent: null, jobs: [] };
+const state = { torrent: null, torrents: [], jobs: [] };
 const $ = (id) => document.getElementById(id);
 const fmtBytes = (bytes = 0) => {
   const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
@@ -454,6 +519,7 @@ async function api(path, options = {}) {
 function renderTorrent(record) {
   state.torrent = record;
   $('startBtn').disabled = false;
+  renderTorrentList(state.torrents);
   const m = record.metadata;
   $('torrentDetails').style.display = 'grid';
   $('torrentDetails').innerHTML = [
@@ -473,6 +539,52 @@ function renderTorrent(record) {
     $('fileList').style.display = 'none';
   }
 }
+
+function renderTorrentList(torrents) {
+  state.torrents = torrents;
+  const root = $('torrentList');
+  if (!torrents.length) {
+    root.innerHTML = '<div class="empty" style="padding:20px;">No uploaded torrents yet.</div>';
+    return;
+  }
+  root.innerHTML = torrents.map(record => {
+    const active = state.torrent && state.torrent.id === record.id;
+    const m = record.metadata || {};
+    return `<div class="torrent-item ${active ? 'active' : ''}">
+      <div class="row" style="justify-content:space-between; align-items:flex-start;">
+        <div>
+          <strong>${escapeHtml(m.name || record.filename)}</strong>
+          <div class="muted tiny" style="margin-top:4px;">${fmtBytes(m.total_length)} · ${escapeHtml(record.filename)}</div>
+        </div>
+        <div class="row">
+          <button class="secondary" type="button" onclick="selectTorrent('${record.id}')">${active ? 'Selected' : 'Select'}</button>
+          <button class="danger" type="button" onclick="deleteTorrent('${record.id}')">Delete</button>
+        </div>
+      </div>
+    </div>`;
+  }).join('');
+}
+async function refreshTorrents() {
+  const data = await api('/api/torrents');
+  renderTorrentList(data.torrents || []);
+  if (!state.torrent && state.torrents.length) renderTorrent(state.torrents[0]);
+}
+function selectTorrent(id) {
+  const record = state.torrents.find(item => item.id === id);
+  if (record) renderTorrent(record);
+}
+async function deleteTorrent(id) {
+  await api(`/api/torrents/${id}`, { method: 'DELETE' });
+  if (state.torrent && state.torrent.id === id) {
+    state.torrent = null;
+    $('startBtn').disabled = true;
+    $('torrentDetails').style.display = 'none';
+    $('fileList').style.display = 'none';
+  }
+  await refreshTorrents();
+  toast('Uploaded torrent removed.');
+}
+
 function renderJobs(jobs) {
   state.jobs = jobs;
   const root = $('jobs');
@@ -500,7 +612,10 @@ function renderJobs(jobs) {
         <span>${fmtBytes(stats.downloaded)} · ${fmtSpeed(stats.speed)}</span>
       </div>
       ${job.error ? `<p style="color:#fecaca; margin-top:10px;">${escapeHtml(job.error)}</p>` : ''}
-      ${['running','queued'].includes(job.status) ? `<button class="danger" style="margin-top:12px;" onclick="stopJob('${job.id}')">Stop</button>` : ''}
+      <div class="row" style="margin-top:12px;">
+        ${job.download_url ? `<a class="file-label" href="${job.download_url}">Download file</a>` : ''}
+        ${['running','queued'].includes(job.status) ? `<button class="danger" onclick="stopJob('${job.id}')">Stop</button>` : ''}
+      </div>
     </article>`;
   }).join('');
 }
@@ -509,6 +624,7 @@ async function uploadTorrent(file) {
   form.append('torrent', file);
   toast('Uploading torrent…');
   const data = await api('/api/torrents', { method: 'POST', body: form });
+  await refreshTorrents();
   renderTorrent(data.torrent);
   toast('Torrent loaded. Review details and start when ready.');
 }
@@ -547,6 +663,7 @@ $('torrentInput').addEventListener('change', (event) => {
 });
 $('startBtn').addEventListener('click', () => startDownload().catch(err => toast(err.message)));
 $('refreshBtn').addEventListener('click', () => refreshJobs().catch(err => toast(err.message)));
+$('refreshTorrentsBtn').addEventListener('click', () => refreshTorrents().catch(err => toast(err.message)));
 const dropzone = $('dropzone');
 for (const eventName of ['dragenter', 'dragover']) {
   dropzone.addEventListener(eventName, event => { event.preventDefault(); dropzone.classList.add('drag'); });
@@ -559,6 +676,7 @@ dropzone.addEventListener('drop', event => {
   if (file) uploadTorrent(file).catch(err => toast(err.message));
 });
 setInterval(() => refreshJobs().catch(() => {}), 1500);
+refreshTorrents().catch(() => {});
 refreshJobs().catch(() => {});
 </script>
 </body>

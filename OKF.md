@@ -30,6 +30,7 @@ Build and maintain WhataBit as a small, understandable Python BitTorrent client 
    - Keep setup simple: Python virtual environment plus `requirements.txt`.
    - Keep generated/runtime files out of Git.
    - Maintain clear README usage and safety instructions.
+   - Web UI torrent library should make uploaded `.torrent` file storage and deletion clear.
 
 ## Focus Areas
 

@@ -84,7 +84,7 @@ Then open:
 http://127.0.0.1:8080
 ```
 
-You can upload a `.torrent` file, inspect metadata, choose download settings, start a download, and watch progress from the browser. Uploaded torrent files are stored under `.whatabit/`, and downloads default to `downloads/`; both are ignored by Git.
+You can upload a `.torrent` file, inspect metadata, choose download settings, start a download, stop active jobs, and watch progress from the browser. Uploaded `.torrent` files are stored under `.whatabit/torrents/` and are shown again after restarting the UI. Completed single-file downloads can be downloaded from the browser when the output file is available. Downloaded payloads default to `downloads/`; `.whatabit/` and `downloads/` are ignored by Git.
 
 To use a different host or port:
 
@@ -93,6 +93,12 @@ python main.py --ui --host 0.0.0.0 --ui-port 8088
 ```
 
 Only bind to `0.0.0.0` on networks you trust.
+
+### What happens to uploaded torrent files?
+
+The Web UI copies uploaded `.torrent` files into `.whatabit/torrents/` under the project directory. These small metadata files are kept locally so you can restart the UI and select them again. Use the Delete button in the Uploaded torrents list to remove one.
+
+The actual downloaded content is separate and goes to the output directory you choose, defaulting to `downloads/`.
 
 ## Usage
 
