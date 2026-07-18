@@ -38,6 +38,8 @@ logger = logging.getLogger("whatabit.download")
 BLOCK_REQUEST_TIMEOUT = 20.0
 MAX_BLOCK_RETRIES = 3
 MAX_PEER_TIMEOUTS = 5
+MAX_PEER_HASH_FAILURES = 2
+MAX_PIECE_HASH_FAILURES = 5
 MAX_PIPELINED_REQUESTS = 5
 
 
@@ -124,6 +126,9 @@ class DownloadManager:
         self.block_retry_count: dict[tuple[int, int], int] = {}
         self.peer_timeout_count: dict[str, int] = {}
         self.timed_out_requests = 0
+        self.bad_pieces = 0
+        self.piece_hash_failures: dict[int, int] = {}
+        self.peer_hash_failures: dict[str, int] = {}
 
         # Output file
         self.output_path = os.path.join(self.output_dir, self.torrent.name)
@@ -409,6 +414,51 @@ class DownloadManager:
             )
         return len(expired)
 
+    async def _handle_piece_hash_failure(self, peer: PeerConnection, index: int, piece: PieceState) -> None:
+        """Discard a corrupt piece, requeue it, and penalize the sender."""
+
+        peer_key = self._peer_key(peer)
+        self.bad_pieces += 1
+        self.piece_hash_failures[index] = self.piece_hash_failures.get(index, 0) + 1
+        self.peer_hash_failures[peer_key] = self.peer_hash_failures.get(peer_key, 0) + 1
+        piece.failed_peers.add(peer_key)
+
+        logger.warning(
+            "Piece %s hash mismatch from %s; requeueing (piece failures=%s, peer failures=%s)",
+            index,
+            peer_key,
+            self.piece_hash_failures[index],
+            self.peer_hash_failures[peer_key],
+        )
+
+        self._clear_piece_pending_requests(index)
+        self.pieces[index] = PieceState(index, piece.length, piece.hash)
+        self.pieces[index].failed_peers = set(piece.failed_peers)
+        for key in list(self.block_retry_count):
+            if key[0] == index:
+                self.block_retry_count.pop(key, None)
+
+        if index not in self.piece_queue:
+            self.piece_queue.append(index)
+
+        self.peer_current_piece.pop(peer_key, None)
+        self.peer_pending_count[peer_key] = 0
+        self._set_status(
+            "downloading",
+            f"Piece {index} failed hash verification; requeued for retry",
+        )
+
+        if self.peer_hash_failures[peer_key] >= MAX_PEER_HASH_FAILURES:
+            self.banned_peers.add(peer_key)
+            await peer.disconnect()
+
+        if self.piece_hash_failures[index] >= MAX_PIECE_HASH_FAILURES:
+            self._set_status(
+                "downloading",
+                f"Piece {index} has failed hash verification {self.piece_hash_failures[index]} times",
+                error=f"Repeated hash failures for piece {index}",
+            )
+
     async def _handle_piece_data(self, peer: PeerConnection, index: int, begin: int, block: bytes):
         """Handle received piece data."""
         if index >= len(self.pieces):
@@ -436,14 +486,7 @@ class DownloadManager:
                 self._update_progress()
                 await self._request_next_block(peer)
             else:
-                logger.warning(f"Piece {index} hash mismatch! Re-requesting...")
-                # Reset piece and re-request
-                self._clear_piece_pending_requests(index)
-                self.pieces[index] = PieceState(index, piece.length, piece.hash)
-                for key in list(self.block_retry_count):
-                    if key[0] == index:
-                        self.block_retry_count.pop(key, None)
-                self.piece_queue.append(index)
+                await self._handle_piece_hash_failure(peer, index, piece)
         else:
             # Request next block for this piece or a new piece
             await self._request_next_block(peer)
@@ -714,6 +757,9 @@ class DownloadManager:
             "banned_peers": len(self.banned_peers),
             "pending_requests": len(self.pending_requests),
             "timed_out_requests": self.timed_out_requests,
+            "bad_pieces": self.bad_pieces,
+            "piece_hash_failures": dict(self.piece_hash_failures),
+            "peer_hash_failures": dict(self.peer_hash_failures),
             "speed": speed,
             "elapsed": elapsed,
             "phase": self.phase,

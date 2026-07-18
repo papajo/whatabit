@@ -65,7 +65,7 @@
 
 - DL-001: Incomplete output safety.
 - DL-002: Block request timeouts/retries. ✅
-- DL-003: Enforced piece hash retries.
+- DL-003: Enforced piece hash retries. ✅
 - DL-005: In-flight request tracking.
 
 **Engineering Tasks**
@@ -83,6 +83,7 @@
 **Sprint 2 Notes**
 
 - DL-002 completed: block requests are tracked, timed-out blocks are released for retry, and peers with repeated timeouts are banned/disconnected for the session.
+- DL-003 completed: corrupt pieces are discarded, requeued, counted, and repeated bad-piece peers are banned/disconnected for the session.
 
 ## Sprint 3 — Persistence and Resume Basics
 
