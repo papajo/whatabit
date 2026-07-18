@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import os
 import time
 import uuid
@@ -23,6 +24,7 @@ from .torrent import TorrentFile
 
 APP_DIR = ".whatabit"
 UPLOAD_DIR = "torrents"
+SESSION_FILE = "session.json"
 DEFAULT_DOWNLOAD_DIR = "downloads"
 
 
@@ -52,11 +54,12 @@ class DownloadJob:
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
     progress: dict[str, Any] = field(default_factory=dict)
+    settings: dict[str, Any] = field(default_factory=dict)
 
     def snapshot(self) -> dict[str, Any]:
         stats = self.manager.get_stats()
         merged = {**stats, **self.progress}
-        output_path = Path(self.output_dir).expanduser() / self.torrent_name
+        output_path = Path(str(merged.get("output_path") or (Path(self.output_dir).expanduser() / self.torrent_name)))
         return {
             "id": self.id,
             "torrent_id": self.torrent_id,
@@ -66,7 +69,8 @@ class DownloadJob:
             "error": self.error,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
-            "download_url": f"/api/downloads/{self.id}/file" if output_path.exists() else "",
+            "settings": self.settings,
+            "download_url": f"/api/downloads/{self.id}/file" if output_path.exists() and self.status == "complete" else "",
             "stats": merged,
         }
 
@@ -78,6 +82,7 @@ class WhataBitWebApp:
         self.base_dir = Path(base_dir).resolve()
         self.app_dir = self.base_dir / APP_DIR
         self.upload_dir = self.app_dir / UPLOAD_DIR
+        self.session_path = self.app_dir / SESSION_FILE
         self.default_download_dir = self.base_dir / DEFAULT_DOWNLOAD_DIR
         self.torrents: dict[str, TorrentRecord] = {}
         self.jobs: dict[str, DownloadJob] = {}
@@ -86,6 +91,7 @@ class WhataBitWebApp:
         self.upload_dir.mkdir(parents=True, exist_ok=True)
         self.default_download_dir.mkdir(parents=True, exist_ok=True)
         self._load_existing_torrents()
+        self._load_existing_jobs()
 
         app = web.Application(client_max_size=64 * 1024 * 1024)
         app["whatabit"] = self
@@ -122,6 +128,90 @@ class WhataBitWebApp:
                 metadata=metadata,
             )
 
+    def _load_existing_jobs(self) -> None:
+        """Load persisted job metadata from the local UI workspace.
+
+        WhataBit 0.2 persists job metadata, not in-flight piece data. Jobs that
+        were active when the app last exited are shown as stopped after restart.
+        """
+
+        self.jobs.clear()
+        if not self.session_path.exists():
+            return
+
+        try:
+            data = json.loads(self.session_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return
+
+        for raw in data.get("jobs", []):
+            if not isinstance(raw, dict):
+                continue
+            torrent_id = str(raw.get("torrent_id") or "")
+            record = self.torrents.get(torrent_id)
+            if record is None:
+                continue
+
+            settings = raw.get("settings") if isinstance(raw.get("settings"), dict) else {}
+            output_dir = str(raw.get("output_dir") or settings.get("output_dir") or self.default_download_dir)
+            manager = DownloadManager(
+                torrent_path=str(record.path),
+                output_dir=output_dir,
+                max_peers=clamp_int(settings.get("max_peers"), default=50, minimum=1, maximum=500),
+                max_connections=clamp_int(settings.get("max_connections"), default=20, minimum=1, maximum=100),
+                port=clamp_int(settings.get("port"), default=6881, minimum=1, maximum=65535),
+            )
+
+            stats = raw.get("stats") if isinstance(raw.get("stats"), dict) else {}
+            status = str(raw.get("status") or "stopped")
+            error = str(raw.get("error") or "")
+            if status in {"queued", "running", "stopping"}:
+                status = "stopped"
+                error = error or "Stopped because the Web UI restarted before this job completed."
+                manager._set_status("stopped", error)
+            elif status == "complete":
+                manager.completed = bool(stats.get("is_complete", True))
+                manager.output_written = bool(stats.get("output_written") or manager.get_stats().get("output_exists"))
+                manager._set_status("complete", str(stats.get("status_message") or "Completed in a previous session"))
+            elif status == "error":
+                manager._set_status("error", error or "Failed in a previous session", error=error)
+            else:
+                manager._set_status("stopped", str(stats.get("status_message") or "Stopped in a previous session"))
+
+            job = DownloadJob(
+                id=str(raw.get("id") or uuid.uuid4().hex),
+                torrent_id=torrent_id,
+                torrent_name=str(raw.get("torrent_name") or record.metadata["name"]),
+                output_dir=output_dir,
+                manager=manager,
+                status=status,
+                error=error,
+                created_at=float(raw.get("created_at") or time.time()),
+                updated_at=float(raw.get("updated_at") or time.time()),
+                progress={
+                    "pieces_complete": int(stats.get("pieces_complete") or 0),
+                    "pieces_total": int(stats.get("pieces_total") or record.metadata.get("pieces") or 0),
+                    "downloaded": int(stats.get("downloaded") or 0),
+                    "speed": 0,
+                    "percent": float(stats.get("percent") or 0),
+                },
+                settings=settings,
+            )
+            self.jobs[job.id] = job
+
+    def _save_session(self) -> None:
+        """Persist durable Web UI job metadata."""
+
+        self.app_dir.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "version": 1,
+            "updated_at": time.time(),
+            "jobs": [job.snapshot() for job in self.jobs.values()],
+        }
+        tmp_path = self.session_path.with_suffix(".tmp")
+        tmp_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+        tmp_path.replace(self.session_path)
+
     async def shutdown(self, _app: web.Application) -> None:
         for job in self.jobs.values():
             job.manager.stop()
@@ -129,6 +219,7 @@ class WhataBitWebApp:
                 job.task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await job.task
+        self._save_session()
 
     async def index(self, _request: web.Request) -> web.Response:
         return web.Response(text=INDEX_HTML, content_type="text/html")
@@ -168,6 +259,7 @@ class WhataBitWebApp:
             metadata=metadata,
         )
         self.torrents[torrent_id] = record
+        self._save_session()
         return web.json_response({"torrent": record_to_json(record)}, status=201)
 
     async def delete_torrent(self, request: web.Request) -> web.Response:
@@ -182,6 +274,7 @@ class WhataBitWebApp:
 
         self.torrents.pop(torrent_id, None)
         record.path.unlink(missing_ok=True)
+        self._save_session()
         return web.json_response({"ok": True})
 
     async def start_download(self, request: web.Request) -> web.Response:
@@ -210,6 +303,7 @@ class WhataBitWebApp:
                 "percent": (completed / total * 100) if total else 0,
             }
             job.updated_at = time.time()
+            self._save_session()
 
         manager = DownloadManager(
             torrent_path=str(record.path),
@@ -232,8 +326,15 @@ class WhataBitWebApp:
                 "speed": 0,
                 "percent": 0,
             },
+            settings={
+                "output_dir": output_dir,
+                "max_peers": max_peers,
+                "max_connections": max_connections,
+                "port": port,
+            },
         )
         self.jobs[job_id] = job
+        self._save_session()
         job.task = asyncio.create_task(self._run_job(job))
         return web.json_response({"job": job.snapshot()}, status=201)
 
@@ -246,6 +347,7 @@ class WhataBitWebApp:
     async def _run_job(self, job: DownloadJob) -> None:
         job.status = "running"
         job.updated_at = time.time()
+        self._save_session()
         try:
             await job.manager.download()
             job.status = "complete" if job.manager.completed else "stopped"
@@ -258,6 +360,7 @@ class WhataBitWebApp:
             job.error = str(exc)
         finally:
             job.updated_at = time.time()
+            self._save_session()
 
     async def list_downloads(self, _request: web.Request) -> web.Response:
         return web.json_response({"jobs": [job.snapshot() for job in self.jobs.values()]})
@@ -287,6 +390,7 @@ class WhataBitWebApp:
             job.task.cancel()
         job.status = "stopping"
         job.updated_at = time.time()
+        self._save_session()
         return web.json_response({"job": job.snapshot()})
 
 
@@ -406,6 +510,7 @@ INDEX_HTML = r"""<!doctype html>
     .pill.running { color: #bae6fd; border-color: rgba(6,182,212,0.35); background: rgba(6,182,212,0.12); }
     .pill.complete { color: #bbf7d0; border-color: rgba(34,197,94,0.35); background: rgba(34,197,94,0.12); }
     .pill.error { color: #fecaca; border-color: rgba(239,68,68,0.35); background: rgba(239,68,68,0.12); }
+    .pill.stopped, .pill.stopping, .pill.no_peers { color: #fde68a; border-color: rgba(245,158,11,0.35); background: rgba(245,158,11,0.12); }
     .bar { height: 12px; border-radius: 999px; background: rgba(148,163,184,0.16); overflow: hidden; border: 1px solid rgba(148,163,184,0.16); }
     .bar > div { height: 100%; width: 0%; border-radius: inherit; background: linear-gradient(90deg, var(--accent), var(--accent-2)); transition: width 250ms ease; }
     .empty { padding: 48px 22px; text-align: center; color: var(--muted); }
@@ -414,11 +519,15 @@ INDEX_HTML = r"""<!doctype html>
     .file-list { max-height: 150px; overflow: auto; margin-top: 12px; border: 1px solid var(--border); border-radius: 14px; }
     .file-row { padding: 9px 12px; display: flex; justify-content: space-between; gap: 10px; border-top: 1px solid rgba(148,163,184,0.12); color: var(--muted); font-size: 0.86rem; }
     .file-row:first-child { border-top: 0; }
+    .job-metrics { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; margin-top: 12px; }
+    .metric { border: 1px solid var(--border); border-radius: 14px; padding: 10px; background: rgba(15,23,42,0.48); }
+    .metric .label { color: var(--muted); font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.08em; }
+    .metric .value { margin-top: 4px; font-size: 0.9rem; overflow-wrap: anywhere; }
     .torrent-list { display: grid; gap: 10px; margin-top: 16px; }
     .torrent-item { padding: 12px; border: 1px solid var(--border); border-radius: 16px; background: rgba(2,6,23,0.34); }
     .torrent-item.active { border-color: rgba(6,182,212,0.55); background: rgba(6,182,212,0.08); }
     .tiny { font-size: 0.78rem; }
-    @media (max-width: 860px) { .grid, .meta, .settings { grid-template-columns: 1fr; } header { align-items: flex-start; flex-direction: column; } }
+    @media (max-width: 860px) { .grid, .meta, .settings, .job-metrics { grid-template-columns: 1fr; } header { align-items: flex-start; flex-direction: column; } }
   </style>
 </head>
 <body>
@@ -504,6 +613,12 @@ const fmtBytes = (bytes = 0) => {
   return `${n.toFixed(i === 0 ? 0 : 1)} ${units[i]}`;
 };
 const fmtSpeed = (bytes = 0) => `${fmtBytes(bytes)}/s`;
+const fmtDuration = (seconds = 0) => {
+  const total = Math.max(0, Math.floor(Number(seconds) || 0));
+  const mins = Math.floor(total / 60);
+  const secs = total % 60;
+  return mins ? `${mins}m ${secs}s` : `${secs}s`;
+};
 const toast = (message) => {
   const el = $('toast');
   el.textContent = message;
@@ -597,21 +712,31 @@ function renderJobs(jobs) {
     const total = stats.pieces_total || 0;
     const done = stats.pieces_complete || 0;
     const pct = total ? (done / total * 100) : (stats.percent || 0);
-    const statusClass = ['running', 'complete', 'error'].includes(job.status) ? job.status : '';
+    const phase = stats.phase || job.status;
+    const statusClass = ['running', 'complete', 'error', 'stopped', 'stopping', 'no_peers'].includes(job.status) ? job.status : phase;
     return `<article class="job">
       <div class="job-title">
         <div>
           <strong>${escapeHtml(job.torrent_name)}</strong>
           <div class="muted" style="margin-top:4px;">${escapeHtml(job.output_dir)}</div>
         </div>
-        <span class="pill ${statusClass}">${escapeHtml(job.status)}</span>
+        <span class="pill ${statusClass}">${escapeHtml(job.status)} · ${escapeHtml(phase)}</span>
       </div>
       <div class="bar"><div style="width:${Math.max(0, Math.min(100, pct))}%"></div></div>
       <div class="row muted" style="justify-content:space-between; margin-top:10px;">
         <span>${done}/${total} pieces · ${pct.toFixed(1)}%</span>
         <span>${fmtBytes(stats.downloaded)} · ${fmtSpeed(stats.speed)}</span>
       </div>
-      ${job.error ? `<p style="color:#fecaca; margin-top:10px;">${escapeHtml(job.error)}</p>` : ''}
+      <p class="muted" style="margin-top:10px;">${escapeHtml(stats.status_message || 'Waiting for status update')}</p>
+      <div class="job-metrics">
+        <div class="metric"><div class="label">Connected</div><div class="value">${stats.connected_peers || 0}</div></div>
+        <div class="metric"><div class="label">Discovered</div><div class="value">${stats.peers_discovered || 0}</div></div>
+        <div class="metric"><div class="label">Queued</div><div class="value">${stats.queued_peers || 0}</div></div>
+        <div class="metric"><div class="label">Elapsed</div><div class="value">${fmtDuration(stats.elapsed || 0)}</div></div>
+        <div class="metric"><div class="label">Output</div><div class="value">${escapeHtml(stats.output_exists ? 'Available' : 'Not written yet')}</div></div>
+        <div class="metric"><div class="label">Path</div><div class="value">${escapeHtml(stats.output_path || job.output_dir)}</div></div>
+      </div>
+      ${(job.error || stats.last_error) ? `<p style="color:#fecaca; margin-top:10px;">${escapeHtml(job.error || stats.last_error)}</p>` : ''}
       <div class="row" style="margin-top:12px;">
         ${job.download_url ? `<a class="file-label" href="${job.download_url}">Download file</a>` : ''}
         ${['running','queued'].includes(job.status) ? `<button class="danger" onclick="stopJob('${job.id}')">Stop</button>` : ''}

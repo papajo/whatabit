@@ -115,16 +115,28 @@ class DownloadManager:
         self.peer_pending_count: dict[str, int] = {}  # ip:port -> pending request count
 
         # Output file
-        self.output_path = ""
+        self.output_path = os.path.join(self.output_dir, self.torrent.name)
         self.output_file: Optional[asyncio.FileIO] = None
 
-        # Control
+        # Control and observable status
         self.running = False
         self.completed = False
         self.start_time = 0.0
+        self.phase = "created"
+        self.status_message = "Ready"
+        self.last_error = ""
+        self.peers_discovered = 0
+        self.output_written = False
 
         # Compute piece sizes
         self._init_pieces()
+
+    def _set_status(self, phase: str, message: str, *, error: str = "") -> None:
+        """Update user-visible download status fields."""
+        self.phase = phase
+        self.status_message = message
+        if error:
+            self.last_error = error
 
     def _init_pieces(self):
         """Initialize piece state from torrent metadata."""
@@ -151,6 +163,7 @@ class DownloadManager:
             return []
 
         try:
+            self._set_status("tracker", f"Contacting UDP tracker {self.torrent.announce}")
             conn_id, _ = udp_connect(self.torrent.announce)
             interval, leechers, seeders, peers = udp_announce(
                 conn_id,
@@ -161,9 +174,11 @@ class DownloadManager:
                 event=EVENT_STARTED,
             )
             logger.info(f"UDP tracker: {len(peers)} peers, seeders={seeders}, leechers={leechers}")
+            self._set_status("tracker", f"UDP tracker returned {len(peers)} peers")
             return peers
         except TrackerError as e:
             logger.warning(f"UDP tracker failed: {e}")
+            self._set_status("tracker", f"UDP tracker failed: {e}", error=str(e))
             return []
 
     async def _contact_http_tracker(self) -> list[tuple[str, int]]:
@@ -173,6 +188,7 @@ class DownloadManager:
             return []
 
         try:
+            self._set_status("tracker", f"Contacting HTTP tracker {url}")
             interval, leechers, seeders, peers = await http_announce(
                 url,
                 self.info_hash,
@@ -181,13 +197,16 @@ class DownloadManager:
                 left=self.torrent.total_length,
             )
             logger.info(f"HTTP tracker: {len(peers)} peers, seeders={seeders}, leechers={leechers}")
+            self._set_status("tracker", f"HTTP tracker returned {len(peers)} peers")
             return peers
         except Exception as e:
             logger.warning(f"HTTP tracker failed: {e}")
+            self._set_status("tracker", f"HTTP tracker failed: {e}", error=str(e))
             return []
 
     async def get_peers(self) -> list[tuple[str, int]]:
         """Get peers from tracker(s). Supports both UDP and HTTP."""
+        self._set_status("tracker", "Contacting tracker(s)")
         all_peers = []
 
         # Try primary announce URL
@@ -221,6 +240,7 @@ class DownloadManager:
                             all_peers.extend(peers)
                     except Exception as e:
                         logger.debug(f"Tier tracker {url_str} failed: {e}")
+                        self._set_status("tracker", f"Tier tracker failed: {url_str}", error=str(e))
                         continue
 
         # Deduplicate
@@ -233,7 +253,10 @@ class DownloadManager:
                 unique_peers.append((ip, port))
 
         random.shuffle(unique_peers)
-        return unique_peers[:self.max_peers]
+        selected = unique_peers[:self.max_peers]
+        self.peers_discovered = len(selected)
+        self._set_status("tracker", f"Found {len(selected)} unique peers")
+        return selected
 
     async def _handle_message(self, peer: PeerConnection, msg: dict):
         """Handle an incoming message from a peer."""
@@ -326,28 +349,50 @@ class DownloadManager:
 
         logger.info(f"Progress: {completed}/{total} pieces complete, {self.bytes_downloaded / (1024*1024):.1f} MiB, {speed / 1024:.1f} KiB/s")
 
+        percent = (completed / total * 100) if total else 0
+        if not self.completed:
+            self._set_status("downloading", f"Downloading: {completed}/{total} pieces ({percent:.1f}%)")
+
         if self.progress_callback:
             self.progress_callback(completed, total, self.bytes_downloaded, speed)
 
         if completed >= total:
             self.completed = True
+            self._set_status("complete", "All pieces downloaded and verified")
 
-    async def _flush_output(self):
-        """Assemble and write all pieces to the output file."""
+    async def _flush_output(self) -> bool:
+        """Assemble and write all pieces to the output file.
+
+        Returns True when a complete verified payload was written. Incomplete
+        downloads are intentionally not flushed because writing zero-filled
+        placeholders makes stopped jobs look like completed downloads.
+        """
+        missing = [i for i, data in enumerate(self.downloaded_pieces) if data is None]
+        if missing or not self.completed:
+            message = (
+                "Skipping output write: download incomplete "
+                f"({len(self.downloaded_pieces) - len(missing)}/{len(self.downloaded_pieces)} pieces complete)"
+            )
+            logger.warning(message)
+            self._set_status("stopped", "Download incomplete; no output file was written")
+            return False
+
         os.makedirs(self.output_dir, exist_ok=True)
-        output_path = os.path.join(self.output_dir, self.torrent.name)
 
-        logger.info(f"Writing output to {output_path}")
-        with open(output_path, "wb") as f:
-            for i, data in enumerate(self.downloaded_pieces):
-                if data is not None:
-                    f.write(data)
-                else:
-                    # Missing piece - fill with zeros
-                    f.write(b"\x00" * self.pieces[i].length)
-                    logger.warning(f"Piece {i} missing, filling with zeros")
+        self._set_status("writing", f"Writing output to {self.output_path}")
+        logger.info(f"Writing output to {self.output_path}")
+        with open(self.output_path, "wb") as f:
+            for data in self.downloaded_pieces:
+                if data is None:
+                    # Defensive guard; the missing check above should prevent this.
+                    logger.warning("Output write aborted because a piece became unavailable")
+                    return False
+                f.write(data)
 
-        logger.info(f"Output written to {output_path}")
+        self.output_written = True
+        self._set_status("complete", f"Output written to {self.output_path}")
+        logger.info(f"Output written to {self.output_path}")
+        return True
 
     async def _request_next_block(self, peer: PeerConnection):
         """Request the next block from a peer."""
@@ -423,6 +468,7 @@ class DownloadManager:
 
     async def connect_to_peers(self):
         """Connect to peers from the pool."""
+        self._set_status("connecting", f"Connecting to peers ({len(self.peer_pool)} available)")
         while self.running and not self.completed and self.peer_pool:
             # Fill up to max_connections
             while len(self.active_connections) < self.max_connections and self.peer_pool:
@@ -437,11 +483,13 @@ class DownloadManager:
                 success = await peer.connect()
                 if success:
                     self.active_connections.append(peer)
+                    self._set_status("downloading", f"Connected to {len(self.active_connections)} peer(s)")
                     peer.on_message = self._handle_message
                     peer.on_disconnect = self._handle_peer_disconnect
                     asyncio.create_task(peer.read_loop())
                 else:
                     self.banned_peers.add(f"{ip}:{port}")
+                    self._set_status("connecting", f"Peer {ip}:{port} failed to connect")
 
             if not self.active_connections:
                 await asyncio.sleep(5)
@@ -461,9 +509,14 @@ class DownloadManager:
         logger.info(f"Size: {self.torrent.total_length / (1024*1024):.1f} MiB in {len(self.pieces)} pieces")
 
         self.running = True
+        self.completed = False
+        self.output_written = False
+        self.last_error = ""
         self.start_time = time.time()
+        self._set_status("starting", f"Starting download of {self.torrent.name}")
 
         # Step 1: Get peers from tracker
+        self._set_status("tracker", "Contacting tracker(s)")
         logger.info("Contacting tracker...")
         self.peer_pool = await self.get_peers()
         logger.info(f"Got {len(self.peer_pool)} unique peers")
@@ -471,6 +524,7 @@ class DownloadManager:
         if not self.peer_pool:
             logger.warning("No peers found from tracker!")
             self.running = False
+            self._set_status("no_peers", "No peers found from tracker(s)")
             return
 
         # Step 2: Connect to peers and download
@@ -490,6 +544,7 @@ class DownloadManager:
             if not self.active_connections or all(
                 not c.is_connected for c in self.active_connections
             ):
+                self._set_status("tracker", "No active peers; re-contacting tracker(s)")
                 logger.info("No active peers, re-contacting tracker...")
                 self.peer_pool = await self.get_peers()
                 if self.peer_pool:
@@ -497,8 +552,12 @@ class DownloadManager:
 
             self._update_progress()
 
-        # Step 4: Write output
-        await self._flush_output()
+        # Step 4: Write output only when complete
+        if self.completed:
+            await self._flush_output()
+        else:
+            self._set_status("stopped", "Download stopped before completion; no output file was written")
+            logger.info("Download stopped before completion; no output file was written")
 
         elapsed = time.time() - self.start_time
         speed = self.bytes_downloaded / elapsed if elapsed > 0 else 0
@@ -508,6 +567,8 @@ class DownloadManager:
     def stop(self):
         """Stop the download."""
         self.running = False
+        if not self.completed:
+            self._set_status("stopping", "Stopping download")
 
     def get_stats(self) -> dict:
         """Get current download statistics."""
@@ -515,6 +576,7 @@ class DownloadManager:
         total = len(self.pieces)
         elapsed = time.time() - self.start_time if self.start_time > 0 else 0
         speed = self.bytes_downloaded / elapsed if elapsed > 0 else 0
+        percent = (completed / total * 100) if total else 0
         return {
             "name": self.torrent.name,
             "info_hash": self.torrent.info_hash_hex,
@@ -522,8 +584,19 @@ class DownloadManager:
             "downloaded": self.bytes_downloaded,
             "pieces_complete": completed,
             "pieces_total": total,
+            "percent": percent,
             "connected_peers": len([c for c in self.active_connections if c.is_connected]),
+            "peers_discovered": self.peers_discovered,
+            "queued_peers": len(self.peer_pool),
+            "banned_peers": len(self.banned_peers),
             "speed": speed,
             "elapsed": elapsed,
+            "phase": self.phase,
+            "status_message": self.status_message,
+            "last_error": self.last_error,
+            "is_running": self.running,
             "is_complete": self.completed,
+            "output_path": self.output_path,
+            "output_exists": os.path.isfile(self.output_path),
+            "output_written": self.output_written,
         }

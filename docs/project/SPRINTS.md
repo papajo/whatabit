@@ -23,7 +23,7 @@
 - README and OKF point to the 0.2 plan.
 - Git status is understood before implementation resumes.
 
-**Status:** In Progress
+**Status:** Done
 
 ## Sprint 1 — Web UI Workflow Hardening
 
@@ -34,13 +34,13 @@
 - UI-004: Start/stop download from Web UI.
 - UI-005: Reliable live progress display.
 - UI-006: Completed output download link.
-- ST-002: Persist basic job metadata.
+- ST-002: Persist basic job metadata. ✅
 
 **Engineering Tasks**
 
 - Split large embedded Web UI into maintainable templates/static assets if it starts slowing iteration.
-- Add job status fields for tracker state, peer count, errors, and output path.
-- Ensure stop/cancel does not flush incomplete output as a completed file.
+- Add job status fields for tracker state, peer count, errors, and output path. ✅
+- Ensure stop/cancel does not flush incomplete output as a completed file. ✅
 
 **Demo**
 
@@ -48,6 +48,12 @@
 - Start a job.
 - See status/progress changes.
 - Stop safely.
+
+**Sprint 1 Notes**
+
+- DL-001 completed: incomplete/stopped downloads no longer write zero-filled final output files.
+- UI-005 completed: download jobs now expose phase, status message, peer counts, output path, speed, elapsed time, and error details in the Web UI.
+- ST-002 completed: Web UI writes `.whatabit/session.json` and reloads completed/stopped job metadata after restart.
 
 ## Sprint 2 — Download Engine Reliability
 

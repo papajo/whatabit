@@ -37,3 +37,23 @@ Uploaded `.torrent` files are stored under `.whatabit/torrents/` and ignored by 
 - UI can reload uploaded torrent metadata at startup.
 - Users can delete uploaded torrents from the UI.
 - Downloaded payloads remain separate under the chosen output directory, defaulting to `downloads/`.
+
+## ADR-003 — Basic Web UI Session Metadata
+
+**Date:** 2026-07-18  
+**Status:** Accepted
+
+### Context
+
+The 0.2 Web UI should preserve user-visible job history after restart, but full piece-level resume belongs to a later persistence/resume story.
+
+### Decision
+
+Persist durable job metadata to `.whatabit/session.json`, including torrent id, output directory, settings, status, timestamps, progress summary, and errors. Jobs that were active during restart are reloaded as stopped.
+
+### Consequences
+
+- Users can see previous completed/stopped/error jobs after restarting the Web UI.
+- This does not imply partial download resume; ST-003 remains open for recheck/resume behavior.
+- `.whatabit/session.json` is runtime state and remains ignored by Git.
+
