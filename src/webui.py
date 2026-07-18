@@ -16,6 +16,7 @@ import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 from aiohttp import web
 
@@ -59,7 +60,16 @@ class DownloadJob:
     def snapshot(self) -> dict[str, Any]:
         stats = self.manager.get_stats()
         merged = {**stats, **self.progress}
-        output_path = Path(str(merged.get("output_path") or (Path(self.output_dir).expanduser() / self.torrent_name)))
+        output_path = job_output_path(self, stats=merged)
+        output_available = self.status == "complete" and output_path.is_file()
+        merged.update(
+            {
+                "output_path": str(output_path),
+                "output_filename": output_path.name,
+                "output_size": output_path.stat().st_size if output_available else 0,
+                "output_available": output_available,
+            }
+        )
         return {
             "id": self.id,
             "torrent_id": self.torrent_id,
@@ -70,7 +80,7 @@ class DownloadJob:
             "created_at": self.created_at,
             "updated_at": self.updated_at,
             "settings": self.settings,
-            "download_url": f"/api/downloads/{self.id}/file" if output_path.exists() and self.status == "complete" else "",
+            "download_url": f"/api/downloads/{self.id}/file" if output_available else "",
             "stats": merged,
         }
 
@@ -379,11 +389,19 @@ class WhataBitWebApp:
         job = self.jobs.get(request.match_info["job_id"])
         if job is None:
             raise web.HTTPNotFound(text="Download job not found")
+        if job.status != "complete":
+            raise web.HTTPConflict(text="Downloaded file is only available after the job completes")
 
-        output_path = Path(job.output_dir) / job.torrent_name
+        output_path = job_output_path(job)
         if not output_path.exists() or not output_path.is_file():
             raise web.HTTPNotFound(text="Downloaded file is not available yet")
-        return web.FileResponse(output_path)
+
+        filename = safe_download_filename(output_path.name)
+        headers = {
+            "Content-Disposition": f'attachment; filename="{filename}"; filename*=UTF-8\'\'{quote(output_path.name)}',
+            "X-WhataBit-Job-Id": job.id,
+        }
+        return web.FileResponse(output_path, headers=headers)
 
     async def stop_download(self, request: web.Request) -> web.Response:
         job = self.jobs.get(request.match_info["job_id"])
@@ -415,6 +433,22 @@ class WhataBitWebApp:
         job.updated_at = time.time()
         self._save_session()
         return web.json_response({"job": job.snapshot()})
+
+
+def job_output_path(job: DownloadJob, *, stats: dict[str, Any] | None = None) -> Path:
+    """Return the expected completed payload path for a Web UI job."""
+
+    raw_path = (stats or {}).get("output_path") if isinstance(stats, dict) else None
+    if raw_path:
+        return Path(str(raw_path)).expanduser()
+    return Path(job.output_dir).expanduser() / job.torrent_name
+
+
+def safe_download_filename(filename: str) -> str:
+    """Sanitize a filename for the ASCII Content-Disposition fallback."""
+
+    cleaned = "".join(ch if ch not in '\r\n"\\' else "_" for ch in str(filename or "download"))
+    return cleaned or "download"
 
 
 def torrent_metadata(path: Path) -> dict[str, Any]:
@@ -756,12 +790,12 @@ function renderJobs(jobs) {
         <div class="metric"><div class="label">Discovered</div><div class="value">${stats.peers_discovered || 0}</div></div>
         <div class="metric"><div class="label">Queued</div><div class="value">${stats.queued_peers || 0}</div></div>
         <div class="metric"><div class="label">Elapsed</div><div class="value">${fmtDuration(stats.elapsed || 0)}</div></div>
-        <div class="metric"><div class="label">Output</div><div class="value">${escapeHtml(stats.output_exists ? 'Available' : 'Not written yet')}</div></div>
+        <div class="metric"><div class="label">Output</div><div class="value">${escapeHtml(stats.output_available ? `Available · ${fmtBytes(stats.output_size)}` : 'Not available yet')}</div></div>
         <div class="metric"><div class="label">Path</div><div class="value">${escapeHtml(stats.output_path || job.output_dir)}</div></div>
       </div>
       ${(job.error || stats.last_error) ? `<p style="color:#fecaca; margin-top:10px;">${escapeHtml(job.error || stats.last_error)}</p>` : ''}
       <div class="row" style="margin-top:12px;">
-        ${job.download_url ? `<a class="file-label" href="${job.download_url}">Download file</a>` : ''}
+        ${job.download_url ? `<a class="file-label" href="${job.download_url}" download="${escapeHtml(stats.output_filename || job.torrent_name)}">Download completed file</a>` : ''}
         ${['running','queued'].includes(job.status) ? `<button class="danger" onclick="stopJob('${job.id}')">Stop</button>` : ''}
       </div>
     </article>`;

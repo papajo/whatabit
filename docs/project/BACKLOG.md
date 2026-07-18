@@ -18,7 +18,7 @@
 | UI-003 | P0 | As a user, I understand what happens to uploaded torrent files. | UI and README explain `.whatabit/torrents/`; Delete removes stored metadata file when safe. | Done |
 | UI-004 | P0 | As a user, I can start and stop a download from the Web UI. | Start creates a job; stop cancels active work; status updates visibly. | Done |
 | UI-005 | P1 | As a user, I can see reliable live progress. | UI shows pieces, percent, downloaded bytes, speed, connected peers, status, and errors. | Done |
-| UI-006 | P1 | As a user, I can download/open completed output from the browser. | Completed single-file output exposes a safe download link. | Partial |
+| UI-006 | P1 | As a user, I can download/open completed output from the browser. | Completed single-file output exposes a safe download link. | Done |
 | UI-007 | P1 | As a user, I can resume a previous UI session. | Uploaded torrent library and job/session metadata reload after restart. | Done |
 
 ### E2 — Reliable Download Engine

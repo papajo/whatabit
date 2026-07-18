@@ -127,3 +127,112 @@ def test_stop_download_transitions_running_job_to_stopped(tmp_path):
         assert app.session_path.exists()
 
     asyncio.run(scenario())
+
+
+def test_completed_job_snapshot_exposes_download_link(tmp_path):
+    torrent_path = tmp_path / ".whatabit" / "torrents" / "torrent999-sample.torrent"
+    write_torrent(torrent_path)
+    app = WhataBitWebApp(tmp_path)
+    app.upload_dir.mkdir(parents=True, exist_ok=True)
+    app._load_existing_torrents()
+
+    record = app.torrents["torrent999"]
+    output_dir = tmp_path / "downloads"
+    output_dir.mkdir()
+    output_file = output_dir / record.metadata["name"]
+    output_file.write_bytes(b"complete payload")
+
+    manager = DownloadManager(str(record.path), output_dir=str(output_dir))
+    manager.completed = True
+    manager.output_written = True
+    manager._set_status("complete", "Output written")
+    job = DownloadJob(
+        id="job999",
+        torrent_id=record.id,
+        torrent_name=record.metadata["name"],
+        output_dir=str(output_dir),
+        manager=manager,
+        status="complete",
+    )
+
+    snapshot = job.snapshot()
+
+    assert snapshot["download_url"] == "/api/downloads/job999/file"
+    assert snapshot["stats"]["output_available"] is True
+    assert snapshot["stats"]["output_size"] == len(b"complete payload")
+    assert snapshot["stats"]["output_filename"] == "payload.bin"
+
+
+def test_download_output_file_requires_completed_job(tmp_path):
+    import asyncio
+    from types import SimpleNamespace
+
+    async def scenario():
+        app = WhataBitWebApp(tmp_path)
+        app.upload_dir.mkdir(parents=True)
+        torrent_path = app.upload_dir / "torrent998-sample.torrent"
+        write_torrent(torrent_path)
+        app._load_existing_torrents()
+        record = app.torrents["torrent998"]
+
+        output_dir = tmp_path / "downloads"
+        output_dir.mkdir()
+        (output_dir / record.metadata["name"]).write_bytes(b"payload")
+        manager = DownloadManager(str(record.path), output_dir=str(output_dir))
+        job = DownloadJob(
+            id="job998",
+            torrent_id=record.id,
+            torrent_name=record.metadata["name"],
+            output_dir=str(output_dir),
+            manager=manager,
+            status="stopped",
+        )
+        app.jobs[job.id] = job
+
+        try:
+            await app.download_output_file(SimpleNamespace(match_info={"job_id": "job998"}))
+        except Exception as exc:
+            assert exc.status == 409
+        else:
+            raise AssertionError("expected incomplete job to be rejected")
+
+    asyncio.run(scenario())
+
+
+def test_download_output_file_returns_attachment_response(tmp_path):
+    import asyncio
+    from types import SimpleNamespace
+
+    async def scenario():
+        app = WhataBitWebApp(tmp_path)
+        app.upload_dir.mkdir(parents=True)
+        torrent_path = app.upload_dir / "torrent997-sample.torrent"
+        write_torrent(torrent_path, name='payload "quoted".bin')
+        app._load_existing_torrents()
+        record = app.torrents["torrent997"]
+
+        output_dir = tmp_path / "downloads"
+        output_dir.mkdir()
+        output_file = output_dir / record.metadata["name"]
+        output_file.write_bytes(b"payload")
+
+        manager = DownloadManager(str(record.path), output_dir=str(output_dir))
+        manager.completed = True
+        job = DownloadJob(
+            id="job997",
+            torrent_id=record.id,
+            torrent_name=record.metadata["name"],
+            output_dir=str(output_dir),
+            manager=manager,
+            status="complete",
+        )
+        app.jobs[job.id] = job
+
+        response = await app.download_output_file(SimpleNamespace(match_info={"job_id": "job997"}))
+
+        assert response.status == 200
+        assert response.headers["X-WhataBit-Job-Id"] == "job997"
+        assert response.headers["Content-Disposition"].startswith("attachment;")
+        assert 'filename="payload _quoted_.bin"' in response.headers["Content-Disposition"]
+
+    asyncio.run(scenario())
