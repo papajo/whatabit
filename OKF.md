@@ -4,6 +4,12 @@
 
 Build and maintain WhataBit as a small, understandable Python BitTorrent client that is useful for learning BitTorrent internals and experimenting with tracker, peer, and download-manager code locally.
 
+## Current Milestone
+
+**WhataBit 0.2:** reliable local Web UI torrent downloader for legal `.torrent` files.
+
+Planning docs live under `docs/project/` and should be updated as priorities, scope, or sprint status changes.
+
 ## Key Results
 
 1. **Reliable torrent metadata parsing**

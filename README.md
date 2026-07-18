@@ -149,6 +149,20 @@ mkdir -p downloads
 python main.py example.torrent -o downloads --max-peers 10 --max-connections 5 -v
 ```
 
+
+## Project planning
+
+WhataBit 0.2 planning artifacts are maintained under [`docs/project/`](docs/project/):
+
+- [`PROJECT_CHARTER.md`](docs/project/PROJECT_CHARTER.md)
+- [`BACKLOG.md`](docs/project/BACKLOG.md)
+- [`SPRINTS.md`](docs/project/SPRINTS.md)
+- [`WBS.md`](docs/project/WBS.md)
+- [`RISKS.md`](docs/project/RISKS.md)
+- [`DECISIONS.md`](docs/project/DECISIONS.md)
+
+These documents should be updated as work is planned, completed, deferred, or reprioritized.
+
 ## Development notes
 
 - Keep imports using the `src.*` package layout when adding new modules.
