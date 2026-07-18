@@ -353,8 +353,12 @@ class WhataBitWebApp:
             job.status = "complete" if job.manager.completed else "stopped"
         except asyncio.CancelledError:
             job.manager.stop()
+            if not job.manager.completed:
+                job.manager._set_status(
+                    "stopped",
+                    "Download stopped by user; no output file was written",
+                )
             job.status = "stopped"
-            raise
         except Exception as exc:
             job.status = "error"
             job.error = str(exc)
@@ -385,10 +389,29 @@ class WhataBitWebApp:
         job = self.jobs.get(request.match_info["job_id"])
         if job is None:
             raise web.HTTPNotFound(text="Download job not found")
+
+        if job.status in {"complete", "error", "stopped"}:
+            return web.json_response({"job": job.snapshot()})
+
         job.manager.stop()
+        job.manager._set_status("stopping", "Stopping download by user request")
+        job.status = "stopping"
+        job.updated_at = time.time()
+        self._save_session()
+
         if job.task and not job.task.done():
             job.task.cancel()
-        job.status = "stopping"
+            with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):
+                await asyncio.wait_for(job.task, timeout=1.0)
+
+        if not job.manager.completed:
+            job.manager._set_status(
+                "stopped",
+                "Download stopped by user; no output file was written",
+            )
+            job.status = "stopped"
+        else:
+            job.status = "complete"
         job.updated_at = time.time()
         self._save_session()
         return web.json_response({"job": job.snapshot()})
@@ -776,7 +799,7 @@ async function refreshJobs() {
 }
 async function stopJob(id) {
   await api(`/api/downloads/${id}/stop`, { method: 'POST' });
-  toast('Stopping download…');
+  toast('Download stopped. No final output is written until a job completes.');
   await refreshJobs();
 }
 function escapeHtml(value) {

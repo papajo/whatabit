@@ -31,7 +31,7 @@
 
 **Candidate Stories**
 
-- UI-004: Start/stop download from Web UI.
+- UI-004: Start/stop download from Web UI. ✅
 - UI-005: Reliable live progress display.
 - UI-006: Completed output download link.
 - ST-002: Persist basic job metadata. ✅
@@ -54,6 +54,7 @@
 - DL-001 completed: incomplete/stopped downloads no longer write zero-filled final output files.
 - UI-005 completed: download jobs now expose phase, status message, peer counts, output path, speed, elapsed time, and error details in the Web UI.
 - ST-002 completed: Web UI writes `.whatabit/session.json` and reloads completed/stopped job metadata after restart.
+- UI-004 completed: stop requests now cancel active jobs, persist a stopped status, and show that no final output is written unless complete.
 
 ## Sprint 2 — Download Engine Reliability
 

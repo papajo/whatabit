@@ -86,3 +86,44 @@ def test_session_reload_marks_active_jobs_stopped(tmp_path):
     assert restored_job.status == "stopped"
     assert "restarted" in restored_job.error
     assert restored_job.snapshot()["stats"]["phase"] == "stopped"
+
+
+def test_stop_download_transitions_running_job_to_stopped(tmp_path):
+    import asyncio
+    import json
+    from types import SimpleNamespace
+
+    async def scenario():
+        app = WhataBitWebApp(tmp_path)
+        app.upload_dir.mkdir(parents=True)
+        torrent_path = app.upload_dir / "torrent789-sample.torrent"
+        write_torrent(torrent_path)
+        app._load_existing_torrents()
+
+        record = app.torrents["torrent789"]
+        manager = DownloadManager(str(record.path), output_dir=str(tmp_path / "downloads"))
+        job = DownloadJob(
+            id="job789",
+            torrent_id=record.id,
+            torrent_name=record.metadata["name"],
+            output_dir=str(tmp_path / "downloads"),
+            manager=manager,
+            status="running",
+        )
+
+        async def active_download():
+            await asyncio.sleep(60)
+
+        job.task = asyncio.create_task(active_download())
+        app.jobs[job.id] = job
+
+        response = await app.stop_download(SimpleNamespace(match_info={"job_id": "job789"}))
+        payload = json.loads(response.text)
+
+        assert payload["job"]["status"] == "stopped"
+        assert payload["job"]["stats"]["phase"] == "stopped"
+        assert payload["job"]["stats"]["status_message"] == "Download stopped by user; no output file was written"
+        assert job.task.done()
+        assert app.session_path.exists()
+
+    asyncio.run(scenario())
