@@ -64,14 +64,14 @@
 **Candidate Stories**
 
 - DL-001: Incomplete output safety.
-- DL-002: Block request timeouts/retries.
+- DL-002: Block request timeouts/retries. ✅
 - DL-003: Enforced piece hash retries.
 - DL-005: In-flight request tracking.
 
 **Engineering Tasks**
 
-- Add block-level request tracking.
-- Add peer timeout/penalty behavior.
+- Add block-level request tracking. ✅
+- Add peer timeout/penalty behavior. ✅
 - Add clear job error states.
 - Add tests for piece state and request scheduling where practical.
 
@@ -79,6 +79,10 @@
 
 - Run a small legal torrent with limited peers.
 - Show progress and correct stop/error behavior.
+
+**Sprint 2 Notes**
+
+- DL-002 completed: block requests are tracked, timed-out blocks are released for retry, and peers with repeated timeouts are banned/disconnected for the session.
 
 ## Sprint 3 — Persistence and Resume Basics
 

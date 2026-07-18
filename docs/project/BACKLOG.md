@@ -26,7 +26,7 @@
 | ID | Priority | Story | Acceptance Criteria | Status |
 | --- | --- | --- | --- | --- |
 | DL-001 | P0 | As a downloader, incomplete downloads must not be marked or written as complete. | Stopped/incomplete jobs do not produce misleading zero-filled final output. | Done |
-| DL-002 | P0 | As a downloader, blocks have request timeouts and retries. | Missing blocks are retried; stalled peers do not stall the whole job indefinitely. | Todo |
+| DL-002 | P0 | As a downloader, blocks have request timeouts and retries. | Missing blocks are retried; stalled peers do not stall the whole job indefinitely. | Done |
 | DL-003 | P0 | As a downloader, piece hashes are enforced. | Bad pieces are discarded/requeued and peers can be penalized. | Partial |
 | DL-004 | P0 | As a downloader, pieces are written safely. | Single-file output is assembled correctly; multi-file behavior is defined and tested. | Todo |
 | DL-005 | P1 | As a downloader, peer scheduling avoids duplicate waste. | Per-peer request windows and in-flight block tracking prevent uncontrolled duplicates. | Todo |

@@ -33,6 +33,13 @@ from .peer import (
 
 logger = logging.getLogger("whatabit.download")
 
+# Block request safety defaults. These keep stalled peers from blocking a job
+# forever while keeping the implementation intentionally simple for 0.2.
+BLOCK_REQUEST_TIMEOUT = 20.0
+MAX_BLOCK_RETRIES = 3
+MAX_PEER_TIMEOUTS = 5
+MAX_PIPELINED_REQUESTS = 5
+
 
 class PieceState:
     """Tracks download state of a single piece."""
@@ -113,6 +120,10 @@ class DownloadManager:
         # Piece assignment tracking
         self.peer_current_piece: dict[str, int] = {}  # ip:port -> current piece index
         self.peer_pending_count: dict[str, int] = {}  # ip:port -> pending request count
+        self.pending_requests: dict[tuple[int, int], dict] = {}  # (piece, begin) -> request metadata
+        self.block_retry_count: dict[tuple[int, int], int] = {}
+        self.peer_timeout_count: dict[str, int] = {}
+        self.timed_out_requests = 0
 
         # Output file
         self.output_path = os.path.join(self.output_dir, self.torrent.name)
@@ -297,6 +308,107 @@ class DownloadManager:
             index, begin, block = parse_piece(payload)
             await self._handle_piece_data(peer, index, begin, block)
 
+    def _peer_key(self, peer: PeerConnection) -> str:
+        return f"{peer.ip}:{peer.port}"
+
+    def _next_missing_block(self, piece: PieceState) -> tuple[int, int] | None:
+        """Return the next unreceived and not-in-flight block for a piece."""
+
+        for begin in range(0, piece.length, DEFAULT_BLOCK_SIZE):
+            key = (piece.index, begin)
+            if begin in piece.blocks or key in self.pending_requests:
+                continue
+            return begin, min(DEFAULT_BLOCK_SIZE, piece.length - begin)
+        return None
+
+    async def _send_block_request(
+        self,
+        peer: PeerConnection,
+        piece_index: int,
+        begin: int,
+        length: int,
+    ) -> None:
+        """Send and track a block request so timeouts can be retried."""
+
+        await peer.send_request(piece_index, begin, length)
+        peer_key = self._peer_key(peer)
+        request_key = (piece_index, begin)
+        self.pending_requests[request_key] = {
+            "peer_key": peer_key,
+            "length": length,
+            "requested_at": time.time(),
+            "attempt": self.block_retry_count.get(request_key, 0) + 1,
+        }
+        self.peer_pending_count[peer_key] = self.peer_pending_count.get(peer_key, 0) + 1
+
+    def _clear_pending_request(self, index: int, begin: int) -> None:
+        request = self.pending_requests.pop((index, begin), None)
+        if not request:
+            return
+        peer_key = str(request.get("peer_key") or "")
+        if peer_key:
+            self.peer_pending_count[peer_key] = max(
+                0,
+                self.peer_pending_count.get(peer_key, 0) - 1,
+            )
+
+    def _clear_piece_pending_requests(self, index: int) -> None:
+        for piece_index, begin in list(self.pending_requests):
+            if piece_index == index:
+                self._clear_pending_request(piece_index, begin)
+
+    async def _check_request_timeouts(self) -> int:
+        """Release stale block requests so they can be retried.
+
+        Returns the number of timed-out block requests. Timed-out blocks become
+        available to `_request_next_block` again. Peers with repeated timeouts
+        are disconnected and banned for this session.
+        """
+
+        now = time.time()
+        expired: list[tuple[int, int, dict]] = []
+        for key, request in list(self.pending_requests.items()):
+            requested_at = float(request.get("requested_at") or now)
+            if now - requested_at >= BLOCK_REQUEST_TIMEOUT:
+                expired.append((key[0], key[1], request))
+
+        for index, begin, request in expired:
+            peer_key = str(request.get("peer_key") or "")
+            self._clear_pending_request(index, begin)
+            request_key = (index, begin)
+            self.block_retry_count[request_key] = self.block_retry_count.get(request_key, 0) + 1
+            self.timed_out_requests += 1
+            if peer_key:
+                self.peer_timeout_count[peer_key] = self.peer_timeout_count.get(peer_key, 0) + 1
+            logger.warning(
+                "Block request timed out: piece=%s begin=%s peer=%s retry=%s",
+                index,
+                begin,
+                peer_key or "unknown",
+                self.block_retry_count[request_key],
+            )
+
+            if self.block_retry_count[request_key] >= MAX_BLOCK_RETRIES:
+                logger.warning(
+                    "Block piece=%s begin=%s exceeded retry target; keeping it eligible for retry",
+                    index,
+                    begin,
+                )
+
+            if peer_key and self.peer_timeout_count.get(peer_key, 0) >= MAX_PEER_TIMEOUTS:
+                self.banned_peers.add(peer_key)
+                for conn in list(self.active_connections):
+                    if self._peer_key(conn) == peer_key:
+                        await conn.disconnect()
+                        break
+
+        if expired:
+            self._set_status(
+                "downloading",
+                f"Retried {len(expired)} timed-out block request(s)",
+            )
+        return len(expired)
+
     async def _handle_piece_data(self, peer: PeerConnection, index: int, begin: int, block: bytes):
         """Handle received piece data."""
         if index >= len(self.pieces):
@@ -306,12 +418,9 @@ class DownloadManager:
         if piece.is_complete:
             return
 
+        self._clear_pending_request(index, begin)
         piece.add_block(begin, block)
         self.bytes_downloaded += len(block)
-
-        # Decrement pending count
-        peer_key = f"{peer.ip}:{peer.port}"
-        self.peer_pending_count[peer_key] = self.peer_pending_count.get(peer_key, 0) - 1
 
         if piece.is_complete:
             # Verify piece hash
@@ -329,7 +438,11 @@ class DownloadManager:
             else:
                 logger.warning(f"Piece {index} hash mismatch! Re-requesting...")
                 # Reset piece and re-request
+                self._clear_piece_pending_requests(index)
                 self.pieces[index] = PieceState(index, piece.length, piece.hash)
+                for key in list(self.block_retry_count):
+                    if key[0] == index:
+                        self.block_retry_count.pop(key, None)
                 self.piece_queue.append(index)
         else:
             # Request next block for this piece or a new piece
@@ -410,13 +523,11 @@ class DownloadManager:
             piece = self.pieces[current_piece_idx]
             if piece.is_complete:
                 current_piece_idx = None
-            elif self.peer_pending_count.get(peer_key, 0) < 5:
-                # Request next block for current piece
-                block_begin = piece.received
-                if block_begin < piece.length:
-                    block_size = min(DEFAULT_BLOCK_SIZE, piece.length - block_begin)
-                    await peer.send_request(current_piece_idx, block_begin, block_size)
-                    self.peer_pending_count[peer_key] = self.peer_pending_count.get(peer_key, 0) + 1
+            elif self.peer_pending_count.get(peer_key, 0) < MAX_PIPELINED_REQUESTS:
+                next_block = self._next_missing_block(piece)
+                if next_block is not None:
+                    block_begin, block_size = next_block
+                    await self._send_block_request(peer, current_piece_idx, block_begin, block_size)
                     return
 
         # Find a new piece to download
@@ -429,18 +540,22 @@ class DownloadManager:
                     peer.bitfield[candidate]):
                     self.peer_current_piece[peer_key] = candidate
                     piece = self.pieces[candidate]
-                    block_size = min(DEFAULT_BLOCK_SIZE, piece.length)
-                    await peer.send_request(candidate, 0, block_size)
-                    self.peer_pending_count[peer_key] = self.peer_pending_count.get(peer_key, 0) + 1
+                    next_block = self._next_missing_block(piece)
+                    if next_block is None:
+                        continue
+                    block_begin, block_size = next_block
+                    await self._send_block_request(peer, candidate, block_begin, block_size)
                     return
                 elif (not self.pieces[candidate].is_complete and
                       not peer.bitfield):
                     # No bitfield yet, can't check - try anyway
                     self.peer_current_piece[peer_key] = candidate
                     piece = self.pieces[candidate]
-                    block_size = min(DEFAULT_BLOCK_SIZE, piece.length)
-                    await peer.send_request(candidate, 0, block_size)
-                    self.peer_pending_count[peer_key] = self.peer_pending_count.get(peer_key, 0) + 1
+                    next_block = self._next_missing_block(piece)
+                    if next_block is None:
+                        continue
+                    block_begin, block_size = next_block
+                    await self._send_block_request(peer, candidate, block_begin, block_size)
                     return
 
     async def _handle_peer_connect(self, peer: PeerConnection) -> bool:
@@ -464,6 +579,9 @@ class DownloadManager:
         current_idx = self.peer_current_piece.pop(peer_key, None)
         if current_idx is not None and not self.pieces[current_idx].is_complete:
             self.piece_queue.append(current_idx)
+        for (piece_index, begin), request in list(self.pending_requests.items()):
+            if request.get("peer_key") == peer_key:
+                self._clear_pending_request(piece_index, begin)
         self.peer_pending_count.pop(peer_key, None)
 
     async def connect_to_peers(self):
@@ -534,6 +652,11 @@ class DownloadManager:
         while self.running and not self.completed:
             await asyncio.sleep(2)
 
+            await self._check_request_timeouts()
+            for conn in list(self.active_connections):
+                if conn.is_connected:
+                    await self._request_next_block(conn)
+
             # Check if all pieces are done
             all_done = all(p.is_complete for p in self.pieces)
             if all_done:
@@ -589,6 +712,8 @@ class DownloadManager:
             "peers_discovered": self.peers_discovered,
             "queued_peers": len(self.peer_pool),
             "banned_peers": len(self.banned_peers),
+            "pending_requests": len(self.pending_requests),
+            "timed_out_requests": self.timed_out_requests,
             "speed": speed,
             "elapsed": elapsed,
             "phase": self.phase,
