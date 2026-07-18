@@ -69,6 +69,31 @@ Show CLI help:
 python main.py --help
 ```
 
+
+## Web UI
+
+WhataBit also includes a lightweight local Web UI built with `aiohttp`. Start it with:
+
+```bash
+python main.py --ui
+```
+
+Then open:
+
+```text
+http://127.0.0.1:8080
+```
+
+You can upload a `.torrent` file, inspect metadata, choose download settings, start a download, and watch progress from the browser. Uploaded torrent files are stored under `.whatabit/`, and downloads default to `downloads/`; both are ignored by Git.
+
+To use a different host or port:
+
+```bash
+python main.py --ui --host 0.0.0.0 --ui-port 8088
+```
+
+Only bind to `0.0.0.0` on networks you trust.
+
 ## Usage
 
 ### Show torrent metadata only

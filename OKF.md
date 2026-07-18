@@ -44,7 +44,7 @@ Build and maintain WhataBit as a small, understandable Python BitTorrent client 
 - DHT support.
 - Magnet link support.
 - Seeding mode.
-- GUI or WebUI.
+- Production-grade GUI, native app, or remotely exposed WebUI.
 - NAT traversal or router port automation.
 
 ## Repository Hygiene
@@ -67,7 +67,10 @@ Before committing meaningful changes:
 python -c "from src import *; print('OK modules load')"
 python main.py --help
 python main.py path/to/legal-test.torrent --info
+python main.py --ui
 ```
+
+For Web UI work, manually check upload, metadata display, start, progress refresh, stop, and mobile-width layout.
 
 When tests exist:
 

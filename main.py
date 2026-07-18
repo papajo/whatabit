@@ -4,6 +4,7 @@
 Usage:
     python main.py <torrent_file>
     python main.py <torrent_file> -o /downloads --max-peers 100 --port 6881 -v
+    python main.py --ui
 
 Supports both UDP (BEP 0015) and HTTP (BEP 0003) trackers.
 """
@@ -77,6 +78,7 @@ Examples:
     )
     parser.add_argument(
         "torrent",
+        nargs="?",
         help="Path to the .torrent file",
     )
     parser.add_argument(
@@ -117,6 +119,22 @@ Examples:
         "--info",
         action="store_true",
         help="Just show torrent info and exit",
+    )
+    parser.add_argument(
+        "--ui",
+        action="store_true",
+        help="Start the local Web UI",
+    )
+    parser.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="Web UI bind host (default: 127.0.0.1)",
+    )
+    parser.add_argument(
+        "--ui-port",
+        type=int,
+        default=8080,
+        help="Web UI port (default: 8080)",
     )
     return parser.parse_args()
 
@@ -161,7 +179,19 @@ def main():
     args = parse_args()
     setup_logging(verbose=args.verbose)
 
+    if args.ui:
+        from src.webui import run_webui
+
+        print(f"Starting WhataBit Web UI at http://{args.host}:{args.ui_port}")
+        run_webui(host=args.host, port=args.ui_port, base_dir=os.getcwd())
+        return
+
     # Validate input
+    if not args.torrent:
+        print("Error: torrent file is required unless --ui is used")
+        print("Run 'python main.py --help' for usage.")
+        sys.exit(1)
+
     if not os.path.isfile(args.torrent):
         print(f"Error: Torrent file not found: {args.torrent}")
         sys.exit(1)

@@ -13,3 +13,4 @@ __pycache__/
 # Local downloads and test artifacts
 downloads/
 *.torrent
+.whatabit/
