@@ -655,6 +655,79 @@ class DownloadManager:
             self._write_file_atomic(target, payload[offset : offset + length])
             offset += length
 
+    def _read_existing_payload(self) -> bytes:
+        """Read existing output payload bytes for recheck/resume."""
+
+        if self.torrent.is_multi_file:
+            chunks: list[bytes] = []
+            for file_info in self.torrent.files:
+                target = self._safe_output_path(
+                    self.torrent.name,
+                    *str(file_info["path"]).split("/"),
+                )
+                if not target.is_file():
+                    return b""
+                data = target.read_bytes()
+                expected = int(file_info["length"])
+                if len(data) != expected:
+                    return b""
+                chunks.append(data)
+            return b"".join(chunks)
+
+        output_path = Path(self.output_path)
+        if not output_path.is_file():
+            return b""
+        return output_path.read_bytes()
+
+    def recheck_existing_output(self) -> dict:
+        """Verify existing output files and mark verified pieces complete.
+
+        This is a conservative 0.2 resume primitive: existing completed pieces
+        are trusted only after SHA-1 verification against the torrent metadata.
+        Missing or corrupt pieces remain queued for download.
+        """
+
+        self._set_status("rechecking", "Rechecking existing output")
+        payload = self._read_existing_payload()
+        self.downloaded_pieces = [None] * len(self.pieces)
+        verified = 0
+        bytes_verified = 0
+        self.piece_queue = []
+        self.pending_requests.clear()
+        self.peer_current_piece.clear()
+        self.peer_pending_count.clear()
+
+        for piece in self.pieces:
+            piece.blocks.clear()
+            piece.received = 0
+            piece.is_complete = False
+
+            start = piece.index * self.torrent.piece_length
+            end = start + piece.length
+            chunk = payload[start:end]
+            if len(chunk) == piece.length and hashlib.sha1(chunk).digest() == piece.hash:
+                piece.blocks[0] = chunk
+                piece.received = len(chunk)
+                piece.is_complete = True
+                self.downloaded_pieces[piece.index] = chunk
+                verified += 1
+                bytes_verified += len(chunk)
+            else:
+                self._queue_piece(piece.index)
+
+        self.bytes_downloaded = bytes_verified
+        self.completed = verified == len(self.pieces) and len(self.pieces) > 0
+        self.output_written = self.completed and os.path.exists(self.output_path)
+
+        if self.completed:
+            self._set_status("complete", "Existing output verified complete")
+        elif verified:
+            self._set_status("rechecked", f"Rechecked existing output: {verified}/{len(self.pieces)} pieces verified")
+        else:
+            self._set_status("rechecked", "No existing verified pieces found")
+
+        return self.get_stats()
+
     async def _flush_output(self) -> bool:
         """Assemble and write all pieces to the output file.
 

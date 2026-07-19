@@ -38,7 +38,7 @@
 | --- | --- | --- | --- | --- |
 | ST-001 | P0 | As a user, uploaded torrents survive UI restart. | Existing `.whatabit/torrents/*.torrent` files load at startup. | Done |
 | ST-002 | P0 | As a user, active/completed job metadata survives restart. | Job list reloads with previous statuses and output paths. | Done |
-| ST-003 | P1 | As a user, partial progress can be resumed or rechecked. | Completed pieces are persisted or rechecked before continuing. | Todo |
+| ST-003 | P1 | As a user, partial progress can be resumed or rechecked. | Completed pieces are persisted or rechecked before continuing. | Done |
 | ST-004 | P1 | As a user, I can remove torrent metadata without deleting downloaded payloads. | Delete action is explicit and safe. | Done |
 
 ### E4 — Quality, Safety, and Documentation

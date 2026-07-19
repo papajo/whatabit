@@ -95,14 +95,14 @@
 **Candidate Stories**
 
 - ST-002: Job/session metadata persistence.
-- ST-003: Partial progress resume or recheck.
+- ST-003: Partial progress resume or recheck. ✅
 - DL-004: Safe file writing behavior. ✅
 
 **Engineering Tasks**
 
 - Introduce `.whatabit/session.json` or SQLite session store.
 - Decide partial-piece storage strategy.
-- Add force recheck command/API if resume-by-state is too risky initially.
+- Add force recheck command/API if resume-by-state is too risky initially. ✅
 
 **Demo**
 
@@ -112,6 +112,7 @@
 **Sprint 3 Notes**
 
 - DL-004 completed early: output writing now uses `.part` replacement, supports multi-file payload splitting, and rejects unsafe output path traversal.
+- ST-003 completed: existing output can be rechecked from the Web UI/API, verified pieces are marked complete before download, and already-complete outputs avoid redownloading.
 
 ## Sprint 4 — 0.2 Stabilization
 

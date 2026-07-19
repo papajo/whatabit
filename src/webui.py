@@ -113,6 +113,7 @@ class WhataBitWebApp:
         app.router.add_get("/api/downloads", self.list_downloads)
         app.router.add_get("/api/downloads/{job_id}", self.get_download)
         app.router.add_get("/api/downloads/{job_id}/file", self.download_output_file)
+        app.router.add_post("/api/downloads/{job_id}/recheck", self.recheck_download)
         app.router.add_post("/api/downloads/{job_id}/stop", self.stop_download)
         app.on_shutdown.append(self.shutdown)
         return app
@@ -344,6 +345,13 @@ class WhataBitWebApp:
             },
         )
         self.jobs[job_id] = job
+        manager.recheck_existing_output()
+        if manager.completed:
+            job.status = "complete"
+            job.updated_at = time.time()
+            self._save_session()
+            return web.json_response({"job": job.snapshot()}, status=201)
+
         self._save_session()
         job.task = asyncio.create_task(self._run_job(job))
         return web.json_response({"job": job.snapshot()}, status=201)
@@ -383,6 +391,20 @@ class WhataBitWebApp:
         job = self.jobs.get(request.match_info["job_id"])
         if job is None:
             raise web.HTTPNotFound(text="Download job not found")
+        return web.json_response({"job": job.snapshot()})
+
+    async def recheck_download(self, request: web.Request) -> web.Response:
+        job = self.jobs.get(request.match_info["job_id"])
+        if job is None:
+            raise web.HTTPNotFound(text="Download job not found")
+        if job.status in {"queued", "running", "stopping"}:
+            raise web.HTTPConflict(text="Cannot recheck an active download")
+
+        job.manager.recheck_existing_output()
+        job.status = "complete" if job.manager.completed else "stopped"
+        job.error = ""
+        job.updated_at = time.time()
+        self._save_session()
         return web.json_response({"job": job.snapshot()})
 
     async def download_output_file(self, request: web.Request) -> web.StreamResponse:
@@ -799,6 +821,7 @@ function renderJobs(jobs) {
       ${(job.error || stats.last_error) ? `<p style="color:#fecaca; margin-top:10px;">${escapeHtml(job.error || stats.last_error)}</p>` : ''}
       <div class="row" style="margin-top:12px;">
         ${job.download_url ? `<a class="file-label" href="${job.download_url}" download="${escapeHtml(stats.output_filename || job.torrent_name)}">Download completed file</a>` : ''}
+        ${!['running','queued','stopping'].includes(job.status) ? `<button class="secondary" onclick="recheckJob('${job.id}')">Recheck output</button>` : ''}
         ${['running','queued'].includes(job.status) ? `<button class="danger" onclick="stopJob('${job.id}')">Stop</button>` : ''}
       </div>
     </article>`;
@@ -833,6 +856,11 @@ async function startDownload() {
 async function refreshJobs() {
   const data = await api('/api/downloads');
   renderJobs(data.jobs || []);
+}
+async function recheckJob(id) {
+  await api(`/api/downloads/${id}/recheck`, { method: 'POST' });
+  toast('Output recheck complete.');
+  await refreshJobs();
 }
 async function stopJob(id) {
   await api(`/api/downloads/${id}/stop`, { method: 'POST' });

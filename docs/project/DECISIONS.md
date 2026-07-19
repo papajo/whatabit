@@ -57,3 +57,22 @@ Persist durable job metadata to `.whatabit/session.json`, including torrent id, 
 - This does not imply partial download resume; ST-003 remains open for recheck/resume behavior.
 - `.whatabit/session.json` is runtime state and remains ignored by Git.
 
+## ADR-004 — Recheck Before Full Resume State
+
+**Date:** 2026-07-18  
+**Status:** Accepted
+
+### Context
+
+Full piece-level resume state is more complex than WhataBit 0.2 needs immediately, but users need a safe way to verify existing output after restart.
+
+### Decision
+
+Implement recheck-first behavior: existing output files are SHA-1 checked against torrent piece hashes. Verified pieces are marked complete, corrupt/missing pieces remain queued, and complete existing output avoids a redownload.
+
+### Consequences
+
+- Resume behavior is conservative and based on actual file verification.
+- Partial `.part` persistence remains a future enhancement, but existing complete/partial single-file outputs can be rechecked.
+- The Web UI exposes an explicit Recheck output action for stopped/completed/error jobs.
+
