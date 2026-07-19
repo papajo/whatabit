@@ -30,7 +30,7 @@
 | DL-003 | P0 | As a downloader, piece hashes are enforced. | Bad pieces are discarded/requeued and peers can be penalized. | Done |
 | DL-004 | P0 | As a downloader, pieces are written safely. | Single-file output is assembled correctly; multi-file behavior is defined and tested. | Done |
 | DL-005 | P1 | As a downloader, peer scheduling avoids duplicate waste. | Per-peer request windows and in-flight block tracking prevent uncontrolled duplicates. | Done |
-| DL-006 | P1 | As a downloader, tracker fallback is observable. | Tracker attempts and failures are visible in logs/status. | Todo |
+| DL-006 | P1 | As a downloader, tracker fallback is observable. | Tracker attempts and failures are visible in logs/status. | Done |
 
 ### E3 — Persistence and State
 

@@ -67,6 +67,7 @@
 - DL-002: Block request timeouts/retries. ✅
 - DL-003: Enforced piece hash retries. ✅
 - DL-005: In-flight request tracking. ✅
+- DL-006: Tracker observability. ✅
 
 **Engineering Tasks**
 
@@ -85,6 +86,7 @@
 - DL-002 completed: block requests are tracked, timed-out blocks are released for retry, and peers with repeated timeouts are banned/disconnected for the session.
 - DL-003 completed: corrupt pieces are discarded, requeued, counted, and repeated bad-piece peers are banned/disconnected for the session.
 - DL-005 completed: piece assignment now preserves unavailable queue entries, avoids duplicate assignment when alternatives exist, and requeues disconnected peer work once.
+- DL-006 completed: tracker attempts, successes, failures, and recent event details are recorded in stats and surfaced in Web UI metrics.
 
 ## Sprint 3 — Persistence and Resume Basics
 

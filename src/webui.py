@@ -788,6 +788,7 @@ function renderJobs(jobs) {
       <div class="job-metrics">
         <div class="metric"><div class="label">Connected</div><div class="value">${stats.connected_peers || 0}</div></div>
         <div class="metric"><div class="label">Discovered</div><div class="value">${stats.peers_discovered || 0}</div></div>
+        <div class="metric"><div class="label">Trackers</div><div class="value">${stats.tracker_successes || 0}/${stats.tracker_attempts || 0} ok · ${stats.tracker_failures || 0} failed</div></div>
         <div class="metric"><div class="label">Queued</div><div class="value">${stats.queued_peers || 0}</div></div>
         <div class="metric"><div class="label">Elapsed</div><div class="value">${fmtDuration(stats.elapsed || 0)}</div></div>
         <div class="metric"><div class="label">Bad pieces</div><div class="value">${stats.bad_pieces || 0}</div></div>

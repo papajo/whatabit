@@ -143,6 +143,10 @@ class DownloadManager:
         self.status_message = "Ready"
         self.last_error = ""
         self.peers_discovered = 0
+        self.tracker_events: list[dict] = []
+        self.tracker_attempts = 0
+        self.tracker_successes = 0
+        self.tracker_failures = 0
         self.output_written = False
 
         # Compute piece sizes
@@ -174,50 +178,83 @@ class DownloadManager:
 
         random.shuffle(self.piece_queue)
 
-    async def _contact_udp_tracker(self) -> list[tuple[str, int]]:
+    def _record_tracker_event(
+        self,
+        url: str,
+        status: str,
+        *,
+        peers: int = 0,
+        error: str = "",
+    ) -> None:
+        """Record a tracker attempt/result for UI and diagnostics."""
+
+        event = {
+            "url": url,
+            "status": status,
+            "peers": peers,
+            "error": error,
+            "time": time.time(),
+        }
+        self.tracker_events.append(event)
+        self.tracker_events = self.tracker_events[-25:]
+        if status == "attempt":
+            self.tracker_attempts += 1
+        elif status == "success":
+            self.tracker_successes += 1
+        elif status == "failed":
+            self.tracker_failures += 1
+
+    async def _contact_udp_tracker(self, url: str | None = None) -> list[tuple[str, int]]:
         """Contact UDP tracker and return list of peers."""
-        if not self.torrent.announce.startswith("udp://"):
+        tracker_url = url or self.torrent.announce
+        if not tracker_url.startswith("udp://"):
             return []
 
         try:
-            self._set_status("tracker", f"Contacting UDP tracker {self.torrent.announce}")
-            conn_id, _ = udp_connect(self.torrent.announce)
+            self._record_tracker_event(tracker_url, "attempt")
+            self._set_status("tracker", f"Contacting UDP tracker {tracker_url}")
+            conn_id, _ = udp_connect(tracker_url)
             interval, leechers, seeders, peers = udp_announce(
                 conn_id,
-                self.torrent.announce,
+                tracker_url,
                 self.info_hash,
                 self.peer_id,
                 left=self.torrent.total_length,
                 event=EVENT_STARTED,
             )
             logger.info(f"UDP tracker: {len(peers)} peers, seeders={seeders}, leechers={leechers}")
+            self._record_tracker_event(tracker_url, "success", peers=len(peers))
             self._set_status("tracker", f"UDP tracker returned {len(peers)} peers")
             return peers
         except TrackerError as e:
             logger.warning(f"UDP tracker failed: {e}")
+            self._record_tracker_event(tracker_url, "failed", error=str(e))
             self._set_status("tracker", f"UDP tracker failed: {e}", error=str(e))
             return []
 
-    async def _contact_http_tracker(self) -> list[tuple[str, int]]:
+    async def _contact_http_tracker(self, url: str | None = None) -> list[tuple[str, int]]:
         """Contact HTTP tracker and return list of peers."""
-        url = self.torrent.announce
-        if not (url.startswith("http://") or url.startswith("https://")):
+        tracker_url = url or self.torrent.announce
+        if not (tracker_url.startswith("http://") or tracker_url.startswith("https://")):
             return []
 
         try:
-            self._set_status("tracker", f"Contacting HTTP tracker {url}")
+            self._record_tracker_event(tracker_url, "attempt")
+            self._set_status("tracker", f"Contacting HTTP tracker {tracker_url}")
             interval, leechers, seeders, peers = await http_announce(
-                url,
+                tracker_url,
                 self.info_hash,
                 self.peer_id,
                 port=self.port,
                 left=self.torrent.total_length,
             )
             logger.info(f"HTTP tracker: {len(peers)} peers, seeders={seeders}, leechers={leechers}")
+            self._record_tracker_event(tracker_url, "success", peers=len(peers))
             self._set_status("tracker", f"HTTP tracker returned {len(peers)} peers")
             return peers
         except Exception as e:
             logger.warning(f"HTTP tracker failed: {e}")
+            self._record_tracker_event(tracker_url, "failed", error=str(e))
             self._set_status("tracker", f"HTTP tracker failed: {e}", error=str(e))
             return []
 
@@ -228,10 +265,10 @@ class DownloadManager:
 
         # Try primary announce URL
         if self.torrent.announce.startswith("udp://"):
-            peers = await self._contact_udp_tracker()
+            peers = await self._contact_udp_tracker(self.torrent.announce)
             all_peers.extend(peers)
         elif self.torrent.announce.startswith(("http://", "https://")):
-            peers = await self._contact_http_tracker()
+            peers = await self._contact_http_tracker(self.torrent.announce)
             all_peers.extend(peers)
 
         # Try announce-list if available
@@ -241,24 +278,12 @@ class DownloadManager:
                     url_str = url.decode("utf-8", errors="replace") if isinstance(url, bytes) else url
                     if url_str == self.torrent.announce:
                         continue  # Already tried
-                    try:
-                        if url_str.startswith("udp://"):
-                            conn_id, _ = udp_connect(url_str)
-                            interval, l, s, peers = udp_announce(
-                                conn_id, url_str, self.info_hash, self.peer_id,
-                                left=self.torrent.total_length,
-                            )
-                            all_peers.extend(peers)
-                        elif url_str.startswith(("http://", "https://")):
-                            interval, l, s, peers = await http_announce(
-                                url_str, self.info_hash, self.peer_id, port=self.port,
-                                left=self.torrent.total_length,
-                            )
-                            all_peers.extend(peers)
-                    except Exception as e:
-                        logger.debug(f"Tier tracker {url_str} failed: {e}")
-                        self._set_status("tracker", f"Tier tracker failed: {url_str}", error=str(e))
-                        continue
+                    if url_str.startswith("udp://"):
+                        peers = await self._contact_udp_tracker(url_str)
+                        all_peers.extend(peers)
+                    elif url_str.startswith(("http://", "https://")):
+                        peers = await self._contact_http_tracker(url_str)
+                        all_peers.extend(peers)
 
         # Deduplicate
         seen = set()
@@ -856,6 +881,10 @@ class DownloadManager:
             "percent": percent,
             "connected_peers": len([c for c in self.active_connections if c.is_connected]),
             "peers_discovered": self.peers_discovered,
+            "tracker_attempts": self.tracker_attempts,
+            "tracker_successes": self.tracker_successes,
+            "tracker_failures": self.tracker_failures,
+            "tracker_events": list(self.tracker_events),
             "queued_peers": len(self.peer_pool),
             "banned_peers": len(self.banned_peers),
             "queued_pieces": len(self.piece_queue),
