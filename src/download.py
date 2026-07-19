@@ -13,6 +13,7 @@ import asyncio
 import hashlib
 import logging
 import os
+from pathlib import Path
 import random
 import time
 from typing import Optional, Callable
@@ -131,7 +132,7 @@ class DownloadManager:
         self.peer_hash_failures: dict[str, int] = {}
 
         # Output file
-        self.output_path = os.path.join(self.output_dir, self.torrent.name)
+        self.output_path = str(self._safe_output_path(self.torrent.name))
         self.output_file: Optional[asyncio.FileIO] = None
 
         # Control and observable status
@@ -576,6 +577,59 @@ class DownloadManager:
             self.completed = True
             self._set_status("complete", "All pieces downloaded and verified")
 
+    def _safe_output_path(self, *parts: str) -> Path:
+        """Build an output path that cannot escape the configured output dir."""
+
+        base = Path(self.output_dir).expanduser().resolve(strict=False)
+        candidate = base
+        for raw_part in parts:
+            for part in Path(str(raw_part)).parts:
+                if part in {"", "."}:
+                    continue
+                if part == ".." or Path(part).is_absolute():
+                    raise ValueError(f"Unsafe torrent output path component: {raw_part}")
+                candidate = candidate / part
+
+        resolved = candidate.resolve(strict=False)
+        try:
+            resolved.relative_to(base)
+        except ValueError as exc:
+            raise ValueError(f"Unsafe torrent output path: {resolved}") from exc
+        return resolved
+
+    def _assembled_payload(self) -> bytes:
+        """Return the full verified payload bytes or raise if any piece is missing."""
+
+        missing = [i for i, data in enumerate(self.downloaded_pieces) if data is None]
+        if missing:
+            raise ValueError(f"Cannot assemble output; missing {len(missing)} piece(s)")
+        return b"".join(data or b"" for data in self.downloaded_pieces)[: self.torrent.total_length]
+
+    def _write_file_atomic(self, path: Path, data: bytes) -> None:
+        """Write a file via a sibling .part file, then replace the final path."""
+
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temp_path = path.with_name(path.name + ".part")
+        with temp_path.open("wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        temp_path.replace(path)
+
+    def _write_single_file_output(self, payload: bytes) -> None:
+        self._write_file_atomic(Path(self.output_path), payload)
+
+    def _write_multi_file_output(self, payload: bytes) -> None:
+        offset = 0
+        root = self._safe_output_path(self.torrent.name)
+        for file_info in self.torrent.files:
+            length = int(file_info["length"])
+            relative_path = str(file_info["path"])
+            target = self._safe_output_path(self.torrent.name, *relative_path.split("/"))
+            target.relative_to(root)  # Defensive: ensures file remains under torrent root.
+            self._write_file_atomic(target, payload[offset : offset + length])
+            offset += length
+
     async def _flush_output(self) -> bool:
         """Assemble and write all pieces to the output file.
 
@@ -597,13 +651,16 @@ class DownloadManager:
 
         self._set_status("writing", f"Writing output to {self.output_path}")
         logger.info(f"Writing output to {self.output_path}")
-        with open(self.output_path, "wb") as f:
-            for data in self.downloaded_pieces:
-                if data is None:
-                    # Defensive guard; the missing check above should prevent this.
-                    logger.warning("Output write aborted because a piece became unavailable")
-                    return False
-                f.write(data)
+        try:
+            payload = self._assembled_payload()
+            if self.torrent.is_multi_file:
+                self._write_multi_file_output(payload)
+            else:
+                self._write_single_file_output(payload)
+        except Exception as exc:
+            self._set_status("error", f"Failed to write output: {exc}", error=str(exc))
+            logger.exception("Failed to write output")
+            return False
 
         self.output_written = True
         self._set_status("complete", f"Output written to {self.output_path}")
@@ -816,6 +873,7 @@ class DownloadManager:
             "is_running": self.running,
             "is_complete": self.completed,
             "output_path": self.output_path,
-            "output_exists": os.path.isfile(self.output_path),
+            "output_exists": os.path.exists(self.output_path),
+            "output_is_dir": os.path.isdir(self.output_path),
             "output_written": self.output_written,
         }

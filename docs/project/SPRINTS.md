@@ -94,7 +94,7 @@
 
 - ST-002: Job/session metadata persistence.
 - ST-003: Partial progress resume or recheck.
-- DL-004: Safe file writing behavior.
+- DL-004: Safe file writing behavior. ✅
 
 **Engineering Tasks**
 
@@ -106,6 +106,10 @@
 
 - Restart UI and see previous torrents/jobs.
 - Recheck or resume a partially downloaded file.
+
+**Sprint 3 Notes**
+
+- DL-004 completed early: output writing now uses `.part` replacement, supports multi-file payload splitting, and rejects unsafe output path traversal.
 
 ## Sprint 4 — 0.2 Stabilization
 
